@@ -1,7 +1,9 @@
 import logging
+import os
 import tempfile
 from gettext import gettext as _
 
+from django.conf import settings
 from django.core.files import File
 
 from pulpcore.plugin.models import ContentArtifact, PublishedMetadata, RemoteArtifact, RepositoryVersion
@@ -31,12 +33,12 @@ def publish(repository_version_pk, index="index.yaml", checkpoint=False):
         )
     )
 
-    with tempfile.TemporaryDirectory(dir="."):
+    with tempfile.TemporaryDirectory(dir=settings.WORKING_DIRECTORY) as temp_dir:
         with HelmChartPublication.create(
             repo_version, pass_through=True, checkpoint=checkpoint
         ) as publication:
             publication.index = index
-            _write_index_file(index, repo_version, publication)
+            _write_index_file(index, repo_version, publication, temp_dir)
 
         log.info(_("Publication: {publication} created").format(publication=publication.pk))
 
@@ -47,18 +49,26 @@ def publish(repository_version_pk, index="index.yaml", checkpoint=False):
         return publication
 
 
-def _write_index_file(index, repo_version, publication):
+def _write_index_file(index, repo_version, publication, temp_dir):
     generated = utc_timestamp()
     entries = list(yield_index_entries_for_version(repo_version, generated))
-    with open(index, "w+", encoding="utf-8") as index_file:
+    index_path = _metadata_path(temp_dir, index)
+    os.makedirs(os.path.dirname(index_path), exist_ok=True)
+    with open(index_path, "w+", encoding="utf-8") as index_file:
         index_file.write(index_from_entries(entries, generated=generated))
         index_file.flush()
 
     PublishedMetadata.create_from_file(
-        file=File(open(index, "rb")),
+        file=File(open(index_path, "rb")),
         publication=publication,
         relative_path=index,
     )
+
+
+def _metadata_path(temp_dir, relative_path):
+    if os.path.isabs(relative_path) or ".." in relative_path.split("/"):
+        raise ValueError("Publication metadata path must be relative and cannot contain '..'.")
+    return os.path.join(temp_dir, relative_path)
 
 
 def yield_index_entries_for_version(repo_version, generated):
