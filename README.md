@@ -74,3 +74,31 @@ The generated `index.yaml` uses relative URLs by default, for example:
 urls:
   - gpu-operator-v26.3.3.tgz
 ```
+
+## Python SDK client
+
+This repository also contains `client/`, a separate installable Python package:
+
+```text
+pulp-helmchart-client
+```
+
+Install from this repository with:
+
+```bash
+pip install "pulp-helmchart-client @ git+ssh://git@github.com/TheFieryLynx/pulp_helmchart.git@main#subdirectory=client"
+```
+
+The import namespace matches Pulp generated clients:
+
+```python
+from pulpcore.client import pulp_helmchart
+
+pulp_helmchart.ApiClient
+pulp_helmchart.Configuration
+pulp_helmchart.RepositoriesHelmchartApi
+pulp_helmchart.ContentChartsApi
+pulp_helmchart.ContentFilesApi
+pulp_helmchart.PublicationsHelmchartApi
+pulp_helmchart.DistributionsHelmchartApi
+```
