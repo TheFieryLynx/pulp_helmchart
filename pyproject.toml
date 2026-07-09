@@ -1,0 +1,41 @@
+[build-system]
+requires = [
+    "setuptools >= 68",
+    "wheel",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pulp-helmchart"
+version = "0.1.0.dev0"
+description = "Pulp plugin for classic Helm chart repositories"
+readme = "README.md"
+authors = [
+  {name = "Pulp Helm Chart Contributors"},
+]
+license = {text = "GPL-2.0-or-later"}
+classifiers = [
+  "Framework :: Django",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+]
+requires-python = ">=3.11"
+dependencies = [
+  "pulpcore>=3.109,<3.116",
+  "PyYAML>=5.1.1,<6.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/pulp/pulp-helmchart"
+Repository = "https://github.com/pulp/pulp-helmchart"
+
+[project.entry-points."pulpcore.plugin"]
+pulp_helmchart = "pulp_helmchart:default_app_config"
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
