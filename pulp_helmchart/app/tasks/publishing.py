@@ -16,7 +16,12 @@ from ..serializers import HelmChartPublicationSerializer
 log = logging.getLogger(__name__)
 
 
-def publish(repository_version_pk, index="index.yaml", checkpoint=False):
+def publish(
+    repository_version_pk,
+    index="index.yaml",
+    checkpoint=False,
+    record_created_resource=True,
+):
     """
     Create a Helm chart publication from a repository version.
 
@@ -24,6 +29,7 @@ def publish(repository_version_pk, index="index.yaml", checkpoint=False):
         repository_version_pk (str): RepositoryVersion primary key to publish.
         index (str): Relative path for the generated Helm index.
         checkpoint (bool): Whether to create a checkpoint publication.
+        record_created_resource (bool): Whether to register the publication on the current task.
     """
     repo_version = RepositoryVersion.objects.get(pk=repository_version_pk)
 
@@ -34,8 +40,11 @@ def publish(repository_version_pk, index="index.yaml", checkpoint=False):
     )
 
     with tempfile.TemporaryDirectory(dir=settings.WORKING_DIRECTORY) as temp_dir:
-        with HelmChartPublication.create(
-            repo_version, pass_through=True, checkpoint=checkpoint
+        with _create_publication(
+            repo_version,
+            pass_through=True,
+            checkpoint=checkpoint,
+            record_created_resource=record_created_resource,
         ) as publication:
             publication.index = index
             _write_index_file(index, repo_version, publication, temp_dir)
@@ -47,6 +56,21 @@ def publish(repository_version_pk, index="index.yaml", checkpoint=False):
         ).data
 
         return publication
+
+
+def _create_publication(repo_version, pass_through, checkpoint, record_created_resource):
+    if record_created_resource:
+        return HelmChartPublication.create(
+            repo_version, pass_through=pass_through, checkpoint=checkpoint
+        )
+
+    publication = HelmChartPublication(
+        pass_through=pass_through,
+        repository_version=repo_version,
+        checkpoint=checkpoint,
+    )
+    publication.save()
+    return publication
 
 
 def _write_index_file(index, repo_version, publication, temp_dir):

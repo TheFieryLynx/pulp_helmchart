@@ -76,7 +76,7 @@ class HelmChartRepository(Repository, AutoAddObjPermsMixin):
         from pulp_helmchart.app import tasks
 
         if self.autopublish:
-            tasks.publish(repository_version_pk=version.pk)
+            tasks.publish(repository_version_pk=version.pk, record_created_resource=False)
 
     def finalize_new_version(self, new_version):
         """
