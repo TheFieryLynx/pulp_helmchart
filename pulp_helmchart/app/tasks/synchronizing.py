@@ -1,3 +1,4 @@
+import logging
 import os
 from gettext import gettext as _
 from urllib.parse import unquote, urlparse
@@ -11,6 +12,7 @@ from pulpcore.plugin.serializers import RepositoryVersionSerializer
 from pulp_helmchart.helm import (
     HelmChartError,
     default_archive_filename,
+    filter_repository_entries,
     parse_repository_index,
     repository_index_url,
     resolve_chart_url,
@@ -20,6 +22,11 @@ from pulp_helmchart.helm import (
 
 from ..content import create_helmchart_content_from_tgz
 from ..models import HelmChartContent, HelmChartRemote, HelmChartRepository
+
+
+log = logging.getLogger(__name__)
+
+UNAVAILABLE_HTTP_STATUSES = {403, 404, 410}
 
 
 def synchronize(remote_pk, repository_pk):
@@ -44,6 +51,7 @@ def synchronize(remote_pk, repository_pk):
         raise ValueError(_("No Helm chart entries matched the remote sync filters."))
 
     synced_content = []
+    skipped_unavailable = []
     downloaded = 0
     reused = 0
     index_digest = _sha256_path(index_result.path)
@@ -52,7 +60,28 @@ def synchronize(remote_pk, repository_pk):
         for entry in entries:
             chart_url = resolve_chart_url(remote.url, entry.urls[0])
             filename = _chart_filename(chart_url, entry.chart_name, entry.version)
-            chart_result = remote.get_downloader(url=chart_url).fetch()
+            try:
+                chart_result = remote.get_downloader(url=chart_url).fetch()
+            except Exception as exc:
+                status = _http_status(exc)
+                if remote.ignore_unavailable and status in UNAVAILABLE_HTTP_STATUSES:
+                    skipped = {
+                        "name": entry.chart_name,
+                        "version": entry.version,
+                        "url": chart_url,
+                        "status": status,
+                    }
+                    skipped_unavailable.append(skipped)
+                    log.warning(
+                        "Skipping unavailable Helm chart archive: name=%s version=%s "
+                        "url=%s status=%s",
+                        entry.chart_name,
+                        entry.version,
+                        chart_url,
+                        status,
+                    )
+                    continue
+                raise
             chart_digest = _sha256_path(chart_result.path)
             verify_sha256_digest(entry.digest, chart_digest, chart_url)
 
@@ -88,6 +117,8 @@ def synchronize(remote_pk, repository_pk):
         "charts_added_or_updated": len(synced_content),
         "charts_created": downloaded,
         "charts_reused": reused,
+        "charts_skipped_unavailable": len(skipped_unavailable),
+        "skipped_unavailable": skipped_unavailable,
         "sync_mode": "additive",
         "most_recent_version": latest_version.number,
     }
@@ -105,26 +136,25 @@ def _chart_filename(url, chart_name, version):
 
 
 def _filter_entries(entries, remote):
-    include_charts = set(remote.include_charts or [])
-    include_versions = set(remote.include_versions or [])
-    selected = [
-        entry
-        for entry in entries
-        if (not include_charts or entry.chart_name in include_charts)
-        and (not include_versions or entry.version in include_versions)
-    ]
+    return filter_repository_entries(
+        entries,
+        include_charts=remote.include_charts,
+        exclude_charts=remote.exclude_charts,
+        include_versions=remote.include_versions,
+        latest_only=remote.latest_only,
+    )
 
-    if not remote.latest_only:
-        return selected
 
-    latest = []
-    seen = set()
-    for entry in selected:
-        if entry.chart_name in seen:
-            continue
-        seen.add(entry.chart_name)
-        latest.append(entry)
-    return latest
+def _http_status(exc):
+    status = getattr(exc, "status", None)
+    if status is not None:
+        return status
+    response = getattr(exc, "response", None)
+    if response is not None:
+        status = getattr(response, "status", None) or getattr(response, "status_code", None)
+        if status is not None:
+            return status
+    return getattr(exc, "status_code", None)
 
 
 def _sha256_path(path):

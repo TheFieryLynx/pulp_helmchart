@@ -56,8 +56,10 @@ class HelmChartRemote(Remote, AutoAddObjPermsMixin):
     TYPE = "helmchart"
 
     include_charts = models.JSONField(default=list)
+    exclude_charts = models.JSONField(default=list)
     include_versions = models.JSONField(default=list)
     latest_only = models.BooleanField(default=False)
+    ignore_unavailable = models.BooleanField(default=True)
 
     class Meta:
         default_related_name = "%(app_label)s_%(model_name)s"

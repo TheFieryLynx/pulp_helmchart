@@ -183,6 +183,40 @@ def verify_sha256_digest(expected: str | None, actual: str, url: str) -> None:
         )
 
 
+def filter_repository_entries(
+    entries: list[RepositoryChartEntry],
+    *,
+    include_charts: list[str] | None = None,
+    exclude_charts: list[str] | None = None,
+    include_versions: list[str] | None = None,
+    latest_only: bool = False,
+) -> list[RepositoryChartEntry]:
+    """Filter parsed Helm repository entries deterministically."""
+    include_chart_names = set(include_charts or [])
+    exclude_chart_names = set(exclude_charts or [])
+    include_version_names = set(include_versions or [])
+
+    selected = [
+        entry
+        for entry in entries
+        if (not include_chart_names or entry.chart_name in include_chart_names)
+        and entry.chart_name not in exclude_chart_names
+        and (not include_version_names or entry.version in include_version_names)
+    ]
+
+    if not latest_only:
+        return selected
+
+    latest = []
+    seen = set()
+    for entry in selected:
+        if entry.chart_name in seen:
+            continue
+        seen.add(entry.chart_name)
+        latest.append(entry)
+    return latest
+
+
 def index_from_entries(entries: list[dict[str, Any]], generated: str | None = None) -> str:
     """Render a deterministic classic Helm repository ``index.yaml`` document."""
     generated = generated or utc_timestamp()

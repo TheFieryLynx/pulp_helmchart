@@ -217,6 +217,12 @@ class HelmChartRemoteSerializer(RemoteSerializer):
         default=list,
         help_text=_("Optional list of chart names to sync. Empty means all charts."),
     )
+    exclude_charts = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        default=list,
+        help_text=_("Optional list of chart names to skip after include_charts is applied."),
+    )
     include_versions = serializers.ListField(
         child=serializers.CharField(),
         required=False,
@@ -228,12 +234,19 @@ class HelmChartRemoteSerializer(RemoteSerializer):
         default=False,
         help_text=_("If true, sync only the first index entry for each selected chart."),
     )
+    ignore_unavailable = serializers.BooleanField(
+        required=False,
+        default=True,
+        help_text=_("If true, skip chart archives that return HTTP 403, 404, or 410."),
+    )
 
     class Meta:
         fields = RemoteSerializer.Meta.fields + (
             "include_charts",
+            "exclude_charts",
             "include_versions",
             "latest_only",
+            "ignore_unavailable",
         )
         model = HelmChartRemote
 

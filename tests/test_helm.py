@@ -6,6 +6,7 @@ import yaml
 
 from pulp_helmchart.helm import (
     HelmChartError,
+    filter_repository_entries,
     index_from_entries,
     parse_chart_archive,
     parse_repository_index,
@@ -133,6 +134,71 @@ def test_repository_index_and_chart_urls_are_resolved():
 def test_verify_sha256_digest_rejects_mismatch():
     with pytest.raises(HelmChartError, match="Digest mismatch"):
         verify_sha256_digest("sha256:expected", "actual", "https://example.test/chart.tgz")
+
+
+def test_filter_repository_entries_includes_selected_charts_only():
+    entries = _repository_entries()
+
+    selected = filter_repository_entries(entries, include_charts=["gpu-operator"])
+
+    assert [(entry.chart_name, entry.version) for entry in selected] == [
+        ("gpu-operator", "v26.3.3"),
+        ("gpu-operator", "v26.3.2"),
+    ]
+
+
+def test_filter_repository_entries_excludes_after_include():
+    entries = _repository_entries()
+
+    selected = filter_repository_entries(
+        entries,
+        include_charts=["gpu-operator", "blocked"],
+        exclude_charts=["blocked"],
+    )
+
+    assert [(entry.chart_name, entry.version) for entry in selected] == [
+        ("gpu-operator", "v26.3.3"),
+        ("gpu-operator", "v26.3.2"),
+    ]
+
+
+def test_filter_repository_entries_latest_only_keeps_first_selected_entry():
+    entries = _repository_entries()
+
+    selected = filter_repository_entries(entries, include_charts=["gpu-operator"], latest_only=True)
+
+    assert [(entry.chart_name, entry.version) for entry in selected] == [
+        ("gpu-operator", "v26.3.3"),
+    ]
+
+
+def _repository_entries():
+    index = io.StringIO(
+        yaml.safe_dump(
+            {
+                "apiVersion": "v1",
+                "entries": {
+                    "blocked": [
+                        {
+                            "version": "1.0.0",
+                            "urls": ["blocked-1.0.0.tgz"],
+                        }
+                    ],
+                    "gpu-operator": [
+                        {
+                            "version": "v26.3.3",
+                            "urls": ["gpu-operator-v26.3.3.tgz"],
+                        },
+                        {
+                            "version": "v26.3.2",
+                            "urls": ["gpu-operator-v26.3.2.tgz"],
+                        },
+                    ],
+                },
+            }
+        )
+    )
+    return parse_repository_index(index)
 
 
 def _chart_archive(chart_yaml):

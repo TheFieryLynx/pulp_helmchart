@@ -150,8 +150,10 @@ class HelmchartHelmchartRemote(_Model):
     download_concurrency: int | None = None
     rate_limit: int | None = None
     include_charts: list[str] | None = None
+    exclude_charts: list[str] | None = None
     include_versions: list[str] | None = None
     latest_only: bool | None = False
+    ignore_unavailable: bool | None = True
 
 
 class PatchedhelmchartHelmchartRemote(_Model):
@@ -177,8 +179,10 @@ class PatchedhelmchartHelmchartRemote(_Model):
     download_concurrency: int | None = None
     rate_limit: int | None = None
     include_charts: list[str] | None = None
+    exclude_charts: list[str] | None = None
     include_versions: list[str] | None = None
     latest_only: bool | None = None
+    ignore_unavailable: bool | None = None
 
 
 class HelmchartHelmchartRemoteResponse(PatchedhelmchartHelmchartRemote):
