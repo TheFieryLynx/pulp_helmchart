@@ -141,6 +141,7 @@ def _filter_entries(entries, remote):
         include_charts=remote.include_charts,
         exclude_charts=remote.exclude_charts,
         include_versions=remote.include_versions,
+        exclude_versions=remote.exclude_versions,
         latest_only=remote.latest_only,
     )
 

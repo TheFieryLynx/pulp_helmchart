@@ -229,6 +229,12 @@ class HelmChartRemoteSerializer(RemoteSerializer):
         default=list,
         help_text=_("Optional list of chart versions to sync. Empty means all versions."),
     )
+    exclude_versions = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        default=list,
+        help_text=_("Optional list of chart versions to skip after include_versions is applied."),
+    )
     latest_only = serializers.BooleanField(
         required=False,
         default=False,
@@ -245,6 +251,7 @@ class HelmChartRemoteSerializer(RemoteSerializer):
             "include_charts",
             "exclude_charts",
             "include_versions",
+            "exclude_versions",
             "latest_only",
             "ignore_unavailable",
         )

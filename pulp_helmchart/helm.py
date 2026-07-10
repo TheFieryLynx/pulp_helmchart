@@ -189,12 +189,14 @@ def filter_repository_entries(
     include_charts: list[str] | None = None,
     exclude_charts: list[str] | None = None,
     include_versions: list[str] | None = None,
+    exclude_versions: list[str] | None = None,
     latest_only: bool = False,
 ) -> list[RepositoryChartEntry]:
     """Filter parsed Helm repository entries deterministically."""
     include_chart_names = set(include_charts or [])
     exclude_chart_names = set(exclude_charts or [])
     include_version_names = set(include_versions or [])
+    exclude_version_names = set(exclude_versions or [])
 
     selected = [
         entry
@@ -202,6 +204,7 @@ def filter_repository_entries(
         if (not include_chart_names or entry.chart_name in include_chart_names)
         and entry.chart_name not in exclude_chart_names
         and (not include_version_names or entry.version in include_version_names)
+        and entry.version not in exclude_version_names
     ]
 
     if not latest_only:

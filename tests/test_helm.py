@@ -172,6 +172,21 @@ def test_filter_repository_entries_latest_only_keeps_first_selected_entry():
     ]
 
 
+def test_filter_repository_entries_excludes_versions_after_include():
+    entries = _repository_entries()
+
+    selected = filter_repository_entries(
+        entries,
+        include_charts=["gpu-operator"],
+        include_versions=["v26.3.3", "v26.3.2"],
+        exclude_versions=["v26.3.2"],
+    )
+
+    assert [(entry.chart_name, entry.version) for entry in selected] == [
+        ("gpu-operator", "v26.3.3"),
+    ]
+
+
 def _repository_entries():
     index = io.StringIO(
         yaml.safe_dump(
