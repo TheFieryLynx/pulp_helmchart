@@ -8,6 +8,6 @@ class PulpHelmChartPluginAppConfig(PulpPluginAppConfig):
 
     name = "pulp_helmchart.app"
     label = "helmchart"
-    version = "0.1.0.dev0"
+    version = "0.2.0.dev0"
     python_package_name = "pulp-helmchart"
     domain_compatible = True

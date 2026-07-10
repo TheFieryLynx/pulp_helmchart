@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pulp-helmchart"
-version = "0.1.0.dev0"
+version = "0.2.0.dev0"
 description = "Pulp plugin for classic Helm chart repositories"
 readme = "README.md"
 authors = [
@@ -24,6 +24,11 @@ requires-python = ">=3.11"
 dependencies = [
   "pulpcore>=3.109,<3.116",
   "PyYAML>=5.1.1,<6.1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8,<9",
 ]
 
 [project.urls]

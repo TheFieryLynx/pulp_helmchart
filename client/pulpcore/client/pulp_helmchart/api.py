@@ -86,7 +86,7 @@ class _Http:
     def _headers(self) -> dict[str, str]:
         headers = {
             "Accept": "application/json",
-            "User-Agent": "OpenAPI-Generator/0.1.0.dev0/python",
+            "User-Agent": "OpenAPI-Generator/0.2.0.dev0/python",
         }
         username = getattr(self.configuration, "username", None)
         password = getattr(self.configuration, "password", None)
