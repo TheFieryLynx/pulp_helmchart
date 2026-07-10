@@ -7,6 +7,7 @@ from pulpcore.plugin.models import (
     Content,
     Distribution,
     Publication,
+    Remote,
     Repository,
 )
 from pulpcore.plugin.publication_utils import validate_publication_paths
@@ -47,6 +48,20 @@ class HelmChartContent(Content):
         ]
 
 
+class HelmChartRemote(Remote, AutoAddObjPermsMixin):
+    """
+    Remote for classic Helm chart repositories.
+    """
+
+    TYPE = "helmchart"
+
+    class Meta:
+        default_related_name = "%(app_label)s_%(model_name)s"
+        permissions = [
+            ("manage_roles_helmchartremote", "Can manage roles on Helm chart remotes"),
+        ]
+
+
 class HelmChartRepository(Repository, AutoAddObjPermsMixin):
     """
     Repository type for classic Helm chart repositories.
@@ -54,7 +69,7 @@ class HelmChartRepository(Repository, AutoAddObjPermsMixin):
 
     TYPE = "helmchart"
     CONTENT_TYPES = [HelmChartContent]
-    REMOTE_TYPES = []
+    REMOTE_TYPES = [HelmChartRemote]
 
     autopublish = models.BooleanField(default=False)
     last_sync_details = models.JSONField(default=dict)
@@ -63,6 +78,7 @@ class HelmChartRepository(Repository, AutoAddObjPermsMixin):
         default_related_name = "%(app_label)s_%(model_name)s"
         permissions = [
             ("modify_helmchartrepository", "Can modify content of the Helm chart repository"),
+            ("sync_helmchartrepository", "Can sync the Helm chart repository"),
             ("manage_roles_helmchartrepository", "Can manage roles on Helm chart repositories"),
             ("repair_helmchartrepository", "Can repair repository versions"),
         ]

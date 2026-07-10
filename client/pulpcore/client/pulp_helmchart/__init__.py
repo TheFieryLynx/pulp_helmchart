@@ -32,6 +32,7 @@ from .models import (
     PatchedhelmchartHelmchartRemote,
     PatchedhelmchartHelmchartRepository,
     RepositoryAddRemoveContent,
+    RepositorySyncURL,
     RepositoryVersionResponse,
 )
 
@@ -55,6 +56,7 @@ __all__ = [
     "HelmchartHelmchartRepositoryResponse",
     "PatchedhelmchartHelmchartRepository",
     "RepositoryAddRemoveContent",
+    "RepositorySyncURL",
     "RepositoryVersionResponse",
     "HelmchartHelmchartRemote",
     "HelmchartHelmchartRemoteResponse",

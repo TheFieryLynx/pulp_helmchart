@@ -13,6 +13,7 @@ from pulpcore.plugin.viewsets import (
     DistributionViewSet,
     OperationPostponedResponse,
     PublicationViewSet,
+    RemoteViewSet,
     RepositoryVersionViewSet,
     RepositoryViewSet,
     RolesMixin,
@@ -24,6 +25,7 @@ from .models import (
     HelmChartContent,
     HelmChartDistribution,
     HelmChartPublication,
+    HelmChartRemote,
     HelmChartRepository,
 )
 from .serializers import (
@@ -31,7 +33,9 @@ from .serializers import (
     HelmChartContentUploadSerializer,
     HelmChartDistributionSerializer,
     HelmChartPublicationSerializer,
+    HelmChartRemoteSerializer,
     HelmChartRepositorySerializer,
+    HelmChartRepositorySyncURLSerializer,
 )
 
 
@@ -141,6 +145,8 @@ class HelmChartRepositoryViewSet(RepositoryViewSet, ModifyRepositoryActionMixin,
                 "effect": "allow",
                 "condition": [
                     "has_model_or_domain_perms:helmchart.add_helmchartrepository",
+                    "has_remote_param_model_or_domain_or_obj_perms:"
+                    "helmchart.view_helmchartremote",
                 ],
             },
             {
@@ -164,6 +170,19 @@ class HelmChartRepositoryViewSet(RepositoryViewSet, ModifyRepositoryActionMixin,
                 "effect": "allow",
                 "condition": [
                     "has_model_or_domain_or_obj_perms:helmchart.change_helmchartrepository",
+                    "has_model_or_domain_or_obj_perms:helmchart.view_helmchartrepository",
+                    "has_remote_param_model_or_domain_or_obj_perms:"
+                    "helmchart.view_helmchartremote",
+                ],
+            },
+            {
+                "action": ["sync"],
+                "principal": "authenticated",
+                "effect": "allow",
+                "condition": [
+                    "has_model_or_domain_or_obj_perms:helmchart.sync_helmchartrepository",
+                    "has_remote_param_model_or_domain_or_obj_perms:"
+                    "helmchart.view_helmchartremote",
                     "has_model_or_domain_or_obj_perms:helmchart.view_helmchartrepository",
                 ],
             },
@@ -203,10 +222,114 @@ class HelmChartRepositoryViewSet(RepositoryViewSet, ModifyRepositoryActionMixin,
             "helmchart.change_helmchartrepository",
             "helmchart.delete_helmchartrepository",
             "helmchart.modify_helmchartrepository",
+            "helmchart.sync_helmchartrepository",
             "helmchart.manage_roles_helmchartrepository",
             "helmchart.repair_helmchartrepository",
         ],
         "helmchart.helmchartrepository_viewer": ["helmchart.view_helmchartrepository"],
+    }
+
+    @extend_schema(
+        description="Trigger an asynchronous task to sync classic Helm chart content.",
+        summary="Sync from a Helm chart remote",
+        responses={202: AsyncOperationResponseSerializer},
+    )
+    @action(detail=True, methods=["post"], serializer_class=HelmChartRepositorySyncURLSerializer)
+    def sync(self, request, pk):
+        """Synchronize a repository from a classic Helm chart remote."""
+        serializer = HelmChartRepositorySyncURLSerializer(
+            data=request.data, context={"request": request, "repository_pk": pk}
+        )
+        serializer.is_valid(raise_exception=True)
+
+        repository = self.get_object()
+        remote = serializer.validated_data.get("remote", repository.remote)
+        result = dispatch(
+            tasks.synchronize,
+            shared_resources=[remote],
+            exclusive_resources=[repository],
+            kwargs={
+                "remote_pk": str(remote.pk),
+                "repository_pk": str(repository.pk),
+            },
+        )
+        return OperationPostponedResponse(result, request)
+
+
+class HelmChartRemoteViewSet(RemoteViewSet, RolesMixin):
+    """
+    Remote classic Helm chart repository containing an ``index.yaml``.
+    """
+
+    endpoint_name = "helmchart"
+    queryset = HelmChartRemote.objects.all()
+    serializer_class = HelmChartRemoteSerializer
+    queryset_filtering_required_permission = "helmchart.view_helmchartremote"
+
+    DEFAULT_ACCESS_POLICY = {
+        "statements": [
+            {
+                "action": ["list", "my_permissions"],
+                "principal": "authenticated",
+                "effect": "allow",
+            },
+            {
+                "action": ["create"],
+                "principal": "authenticated",
+                "effect": "allow",
+                "condition": "has_model_or_domain_perms:helmchart.add_helmchartremote",
+            },
+            {
+                "action": ["retrieve"],
+                "principal": "authenticated",
+                "effect": "allow",
+                "condition": "has_model_or_domain_or_obj_perms:helmchart.view_helmchartremote",
+            },
+            {
+                "action": ["update", "partial_update", "set_label", "unset_label"],
+                "principal": "authenticated",
+                "effect": "allow",
+                "condition": [
+                    "has_model_or_domain_or_obj_perms:helmchart.change_helmchartremote",
+                    "has_model_or_domain_or_obj_perms:helmchart.view_helmchartremote",
+                ],
+            },
+            {
+                "action": ["destroy"],
+                "principal": "authenticated",
+                "effect": "allow",
+                "condition": [
+                    "has_model_or_domain_or_obj_perms:helmchart.delete_helmchartremote",
+                    "has_model_or_domain_or_obj_perms:helmchart.view_helmchartremote",
+                ],
+            },
+            {
+                "action": ["list_roles", "add_role", "remove_role"],
+                "principal": "authenticated",
+                "effect": "allow",
+                "condition": [
+                    "has_model_or_domain_or_obj_perms:"
+                    "helmchart.manage_roles_helmchartremote"
+                ],
+            },
+        ],
+        "creation_hooks": [
+            {
+                "function": "add_roles_for_object_creator",
+                "parameters": {"roles": "helmchart.helmchartremote_owner"},
+            },
+        ],
+        "queryset_scoping": {"function": "scope_queryset"},
+    }
+    LOCKED_ROLES = {
+        "helmchart.helmchartremote_creator": ["helmchart.add_helmchartremote"],
+        "helmchart.helmchartremote_owner": [
+            "helmchart.view_helmchartremote",
+            "helmchart.change_helmchartremote",
+            "helmchart.delete_helmchartremote",
+            "helmchart.manage_roles_helmchartremote",
+        ],
+        "helmchart.helmchartremote_viewer": ["helmchart.view_helmchartremote"],
     }
 
 

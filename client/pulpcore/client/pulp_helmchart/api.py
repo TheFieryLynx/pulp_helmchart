@@ -30,6 +30,7 @@ from .models import (
     PatchedhelmchartHelmchartRemote,
     PatchedhelmchartHelmchartRepository,
     RepositoryAddRemoveContent,
+    RepositorySyncURL,
     RepositoryVersionResponse,
 )
 
@@ -213,6 +214,24 @@ class RepositoriesHelmchartApi(_CrudApi):
             "POST",
             path,
             body=repository_add_remove_content,
+            response_model=AsyncOperationResponse,
+        )
+
+    def sync(
+        self,
+        helmchart_helmchart_repository_href: str,
+        repository_sync_url: RepositorySyncURL | None = None,
+        **kwargs: Any,
+    ) -> AsyncOperationResponse:
+        path = _join_href(helmchart_helmchart_repository_href, "sync/")
+        body = repository_sync_url or RepositorySyncURL(
+            remote=kwargs.get("remote"),
+            mirror=kwargs.get("mirror"),
+        )
+        return self._http.request(
+            "POST",
+            path,
+            body=body,
             response_model=AsyncOperationResponse,
         )
 

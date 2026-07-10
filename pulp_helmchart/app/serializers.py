@@ -3,18 +3,18 @@ from gettext import gettext as _
 from tempfile import NamedTemporaryFile
 
 from django.conf import settings
-from django.db import DatabaseError
 from rest_framework import serializers
 
 from pulpcore.plugin import models
 from pulpcore.plugin.files import PulpTemporaryUploadedFile
 from pulpcore.plugin.serializers import (
-    ArtifactSerializer,
     ContentChecksumSerializer,
     DetailRelatedField,
     DistributionSerializer,
     PublicationSerializer,
+    RemoteSerializer,
     RepositorySerializer,
+    RepositorySyncURLSerializer,
     SingleArtifactContentUploadSerializer,
 )
 from pulpcore.plugin.util import get_domain_pk
@@ -25,10 +25,12 @@ from pulp_helmchart.helm import (
     parse_chart_archive,
 )
 
+from .content import create_helmchart_content_from_tgz
 from .models import (
     HelmChartContent,
     HelmChartDistribution,
     HelmChartPublication,
+    HelmChartRemote,
     HelmChartRepository,
 )
 
@@ -143,7 +145,7 @@ class HelmChartContentUploadSerializer(HelmChartContentSerializer):
     """
 
     def validate(self, data):
-        """Validate chart upload data and create/reuse an Artifact synchronously."""
+        """Validate chart upload data and prepare the archive file for synchronous creation."""
         data = super().validate(data)
 
         if upload := data.pop("upload", None):
@@ -163,31 +165,72 @@ class HelmChartContentUploadSerializer(HelmChartContentSerializer):
                 file_url, expected_digests=expected_digests, expected_size=expected_size
             )
 
-        if file := data.pop("file", None):
-            self._populate_chart_fields(data, file=file)
-            try:
-                artifact = models.Artifact.objects.get(
-                    sha256=file.hashers["sha256"].hexdigest(), pulp_domain=get_domain_pk()
-                )
-                if not artifact.pulp_domain.get_storage().exists(artifact.file.name):
-                    artifact.file = file
-                    artifact.save()
-                else:
-                    artifact.touch()
-            except (models.Artifact.DoesNotExist, DatabaseError):
-                serializer = ArtifactSerializer(data={"file": file})
-                serializer.is_valid(raise_exception=True)
-                artifact = serializer.save()
-            data["artifact"] = artifact
-        else:
-            self._populate_chart_fields(data)
-
         return data
+
+    def create(self, validated_data):
+        """Create or reuse chart content through the shared Helm chart helper."""
+        repository = validated_data.pop("repository", None)
+        relative_path = validated_data.pop("relative_path", None)
+        file = validated_data.pop("file", None)
+        artifact = validated_data.pop("artifact", None)
+
+        close_after = False
+        if file is None and artifact is not None:
+            file = artifact.file
+            file.open("rb")
+            close_after = True
+        try:
+            result = create_helmchart_content_from_tgz(file, relative_path=relative_path)
+        finally:
+            if close_after:
+                file.close()
+
+        if repository:
+            repository = repository.cast()
+            with repository.new_version() as new_version:
+                new_version.add_content(HelmChartContent.objects.filter(pk=result.content.pk))
+
+        return result.content
 
     class Meta:
         fields = HelmChartContentSerializer.Meta.fields
         model = HelmChartContent
         ref_name = "HelmChartContentUploadSerializer"
+
+
+class HelmChartRemoteSerializer(RemoteSerializer):
+    """
+    Serializer for classic Helm chart remotes.
+    """
+
+    policy = serializers.ChoiceField(
+        help_text=_(
+            "The policy to use when downloading content. For the first sync implementation "
+            "charts are downloaded immediately."
+        ),
+        choices=models.Remote.POLICY_CHOICES,
+        default=models.Remote.IMMEDIATE,
+    )
+
+    class Meta:
+        fields = RemoteSerializer.Meta.fields
+        model = HelmChartRemote
+
+
+class HelmChartRepositorySyncURLSerializer(RepositorySyncURLSerializer):
+    """
+    Serializer for Helm chart repository sync requests.
+    """
+
+    mirror = serializers.BooleanField(required=False, default=False)
+
+    def validate(self, data):
+        data = super().validate(data)
+        if data.get("mirror"):
+            raise serializers.ValidationError(
+                {"mirror": _("Mirror sync is not implemented for Helm chart repositories yet.")}
+            )
+        return data
 
 
 class HelmChartRepositorySerializer(RepositorySerializer):

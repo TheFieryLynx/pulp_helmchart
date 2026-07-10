@@ -4,7 +4,15 @@ import tarfile
 import pytest
 import yaml
 
-from pulp_helmchart.helm import HelmChartError, index_from_entries, parse_chart_archive
+from pulp_helmchart.helm import (
+    HelmChartError,
+    index_from_entries,
+    parse_chart_archive,
+    parse_repository_index,
+    repository_index_url,
+    resolve_chart_url,
+    verify_sha256_digest,
+)
 
 
 def test_parse_chart_archive_reads_chart_yaml_metadata():
@@ -77,6 +85,54 @@ def test_index_from_entries_groups_and_sorts_deterministically():
     assert [entry["version"] for entry in parsed["entries"]["alpha"]] == ["2.0.0", "1.0.0"]
     assert parsed["entries"]["alpha"][0]["urls"] == ["alpha-2.0.0.tgz"]
     assert parsed["generated"] == "2026-01-02T00:00:00.000000Z"
+
+
+def test_parse_repository_index_reads_chart_entries():
+    index = io.StringIO(
+        yaml.safe_dump(
+            {
+                "apiVersion": "v1",
+                "entries": {
+                    "gpu-operator": [
+                        {
+                            "apiVersion": "v2",
+                            "name": "gpu-operator",
+                            "version": "v26.3.3",
+                            "urls": ["gpu-operator-v26.3.3.tgz"],
+                            "digest": "abc123",
+                        }
+                    ]
+                },
+            }
+        )
+    )
+
+    entries = parse_repository_index(index)
+
+    assert len(entries) == 1
+    assert entries[0].chart_name == "gpu-operator"
+    assert entries[0].version == "v26.3.3"
+    assert entries[0].urls == ["gpu-operator-v26.3.3.tgz"]
+    assert entries[0].digest == "abc123"
+
+
+def test_repository_index_and_chart_urls_are_resolved():
+    remote = "https://helm.ngc.nvidia.com/nvidia"
+
+    assert repository_index_url(remote) == "https://helm.ngc.nvidia.com/nvidia/index.yaml"
+    assert (
+        resolve_chart_url(remote, "gpu-operator-v26.3.3.tgz")
+        == "https://helm.ngc.nvidia.com/nvidia/gpu-operator-v26.3.3.tgz"
+    )
+    assert (
+        resolve_chart_url(remote, "https://example.com/charts/gpu-operator-v26.3.3.tgz")
+        == "https://example.com/charts/gpu-operator-v26.3.3.tgz"
+    )
+
+
+def test_verify_sha256_digest_rejects_mismatch():
+    with pytest.raises(HelmChartError, match="Digest mismatch"):
+        verify_sha256_digest("sha256:expected", "actual", "https://example.test/chart.tgz")
 
 
 def _chart_archive(chart_yaml):

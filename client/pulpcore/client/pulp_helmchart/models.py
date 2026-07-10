@@ -122,6 +122,11 @@ class RepositoryAddRemoveContent(_Model):
     base_version: str | None = None
 
 
+class RepositorySyncURL(_Model):
+    remote: str | None = None
+    mirror: bool | None = False
+
+
 class HelmchartHelmchartRemote(_Model):
     pulp_labels: dict[str, str | None] | None = None
     name: str

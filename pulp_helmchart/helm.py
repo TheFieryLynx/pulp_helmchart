@@ -6,6 +6,7 @@ import tarfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urljoin
 
 import yaml
 
@@ -28,6 +29,17 @@ class ChartMetadata:
     description: str | None
     annotations: dict[str, Any] | None
     chart_yaml: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class RepositoryChartEntry:
+    """One chart archive reference parsed from a classic Helm repository index."""
+
+    chart_name: str
+    version: str
+    urls: list[str]
+    digest: str | None
+    raw: dict[str, Any]
 
 
 def utc_timestamp(value: datetime | None = None) -> str:
@@ -95,6 +107,80 @@ def parse_chart_archive(fileobj) -> ChartMetadata:
         annotations=_optional_dict(chart_yaml.get("annotations")),
         chart_yaml=_json_compatible(chart_yaml),
     )
+
+
+def parse_repository_index(fileobj) -> list[RepositoryChartEntry]:
+    """Parse chart entries from a classic Helm repository ``index.yaml`` file."""
+    try:
+        index = yaml.safe_load(fileobj)
+    except yaml.YAMLError as exc:
+        raise HelmChartError("Helm repository index.yaml is not valid YAML.") from exc
+
+    if not isinstance(index, dict):
+        raise HelmChartError("Helm repository index.yaml must be a YAML mapping.")
+    entries = index.get("entries")
+    if not isinstance(entries, dict):
+        raise HelmChartError("Helm repository index.yaml must define an 'entries' mapping.")
+
+    parsed: list[RepositoryChartEntry] = []
+    for chart_name in sorted(entries):
+        chart_entries = entries[chart_name]
+        if not isinstance(chart_entries, list):
+            raise HelmChartError(
+                f"Helm repository index entry for '{chart_name}' must be a list."
+            )
+        for entry in chart_entries:
+            if not isinstance(entry, dict):
+                raise HelmChartError(
+                    f"Helm repository index entry for '{chart_name}' must be a mapping."
+                )
+            version = entry.get("version")
+            urls = entry.get("urls")
+            if not version or not isinstance(version, str):
+                raise HelmChartError(
+                    f"Helm repository index entry for '{chart_name}' is missing string version."
+                )
+            if not isinstance(urls, list) or not urls or not isinstance(urls[0], str):
+                raise HelmChartError(
+                    f"Helm repository index entry for '{chart_name}' version '{version}' "
+                    "must include at least one URL."
+                )
+            digest = entry.get("digest")
+            parsed.append(
+                RepositoryChartEntry(
+                    chart_name=str(entry.get("name") or chart_name),
+                    version=version,
+                    urls=[str(url) for url in urls],
+                    digest=str(digest) if digest else None,
+                    raw=_json_compatible(entry),
+                )
+            )
+
+    return parsed
+
+
+def repository_index_url(remote_url: str) -> str:
+    """Return the index URL for a classic Helm repository remote URL."""
+    if remote_url.rstrip("/").endswith("/index.yaml"):
+        return remote_url
+    return urljoin(remote_url.rstrip("/") + "/", "index.yaml")
+
+
+def resolve_chart_url(remote_url: str, chart_url: str) -> str:
+    """Resolve a chart archive URL from an upstream Helm index entry."""
+    base = remote_url if remote_url.rstrip("/").endswith("/index.yaml") else remote_url.rstrip("/") + "/"
+    return urljoin(base, chart_url)
+
+
+def verify_sha256_digest(expected: str | None, actual: str, url: str) -> None:
+    """Verify an optional Helm index sha256 digest value."""
+    if not expected:
+        return
+    expected = expected.removeprefix("sha256:")
+    if expected != actual:
+        raise HelmChartError(
+            f"Digest mismatch for chart '{url}': expected sha256 {expected}, got {actual}."
+        )
 
 
 def index_from_entries(entries: list[dict[str, Any]], generated: str | None = None) -> str:
