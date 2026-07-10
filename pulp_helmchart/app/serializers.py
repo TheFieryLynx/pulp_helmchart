@@ -211,9 +211,30 @@ class HelmChartRemoteSerializer(RemoteSerializer):
         choices=models.Remote.POLICY_CHOICES,
         default=models.Remote.IMMEDIATE,
     )
+    include_charts = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        default=list,
+        help_text=_("Optional list of chart names to sync. Empty means all charts."),
+    )
+    include_versions = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        default=list,
+        help_text=_("Optional list of chart versions to sync. Empty means all versions."),
+    )
+    latest_only = serializers.BooleanField(
+        required=False,
+        default=False,
+        help_text=_("If true, sync only the first index entry for each selected chart."),
+    )
 
     class Meta:
-        fields = RemoteSerializer.Meta.fields
+        fields = RemoteSerializer.Meta.fields + (
+            "include_charts",
+            "include_versions",
+            "latest_only",
+        )
         model = HelmChartRemote
 
 

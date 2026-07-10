@@ -149,6 +149,9 @@ class HelmchartHelmchartRemote(_Model):
     headers: list[dict[str, str]] | None = None
     download_concurrency: int | None = None
     rate_limit: int | None = None
+    include_charts: list[str] | None = None
+    include_versions: list[str] | None = None
+    latest_only: bool | None = False
 
 
 class PatchedhelmchartHelmchartRemote(_Model):
@@ -173,6 +176,9 @@ class PatchedhelmchartHelmchartRemote(_Model):
     headers: list[dict[str, str]] | None = None
     download_concurrency: int | None = None
     rate_limit: int | None = None
+    include_charts: list[str] | None = None
+    include_versions: list[str] | None = None
+    latest_only: bool | None = None
 
 
 class HelmchartHelmchartRemoteResponse(PatchedhelmchartHelmchartRemote):

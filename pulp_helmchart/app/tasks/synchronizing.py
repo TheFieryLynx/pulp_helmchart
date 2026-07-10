@@ -38,7 +38,10 @@ def synchronize(remote_pk, repository_pk):
     index_url = repository_index_url(remote.url)
     index_result = remote.get_downloader(url=index_url).fetch()
     with open(index_result.path, "rb") as index_file:
-        entries = parse_repository_index(index_file)
+        all_entries = parse_repository_index(index_file)
+    entries = _filter_entries(all_entries, remote)
+    if not entries:
+        raise ValueError(_("No Helm chart entries matched the remote sync filters."))
 
     synced_content = []
     downloaded = 0
@@ -81,6 +84,7 @@ def synchronize(remote_pk, repository_pk):
         "index_checksum": index_digest,
         "synced_at": timezone.now().isoformat(),
         "charts_seen": len(entries),
+        "charts_available": len(all_entries),
         "charts_added_or_updated": len(synced_content),
         "charts_created": downloaded,
         "charts_reused": reused,
@@ -98,6 +102,29 @@ def synchronize(remote_pk, repository_pk):
 def _chart_filename(url, chart_name, version):
     filename = os.path.basename(unquote(urlparse(url).path))
     return filename or default_archive_filename(chart_name, version)
+
+
+def _filter_entries(entries, remote):
+    include_charts = set(remote.include_charts or [])
+    include_versions = set(remote.include_versions or [])
+    selected = [
+        entry
+        for entry in entries
+        if (not include_charts or entry.chart_name in include_charts)
+        and (not include_versions or entry.version in include_versions)
+    ]
+
+    if not remote.latest_only:
+        return selected
+
+    latest = []
+    seen = set()
+    for entry in selected:
+        if entry.chart_name in seen:
+            continue
+        seen.add(entry.chart_name)
+        latest.append(entry)
+    return latest
 
 
 def _sha256_path(path):
