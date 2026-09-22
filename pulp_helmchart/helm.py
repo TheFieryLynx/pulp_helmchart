@@ -188,23 +188,32 @@ def filter_repository_entries(
     *,
     include_charts: list[str] | None = None,
     exclude_charts: list[str] | None = None,
-    include_versions: list[str] | None = None,
-    exclude_versions: list[str] | None = None,
+    include_versions: dict[str, list[str]] | None = None,
+    exclude_versions: dict[str, list[str]] | None = None,
+    auto_excluded_versions: dict[str, dict[str, Any]] | None = None,
     latest_only: bool = False,
 ) -> list[RepositoryChartEntry]:
     """Filter parsed Helm repository entries deterministically."""
     include_chart_names = set(include_charts or [])
     exclude_chart_names = set(exclude_charts or [])
-    include_version_names = set(include_versions or [])
-    exclude_version_names = set(exclude_versions or [])
+    include_version_names = {name: set(versions) for name, versions in (include_versions or {}).items()}
+    exclude_version_names = {name: set(versions) for name, versions in (exclude_versions or {}).items()}
+    auto_excluded_versions = auto_excluded_versions or {}
 
     selected = [
         entry
         for entry in entries
         if (not include_chart_names or entry.chart_name in include_chart_names)
         and entry.chart_name not in exclude_chart_names
-        and (not include_version_names or entry.version in include_version_names)
-        and entry.version not in exclude_version_names
+        and (
+            (entry.chart_name not in include_version_names and "*" not in include_version_names)
+            or entry.version in include_version_names.get(
+                entry.chart_name, include_version_names.get("*", ())
+            )
+        )
+        and entry.version not in exclude_version_names.get("*", ())
+        and entry.version not in exclude_version_names.get(entry.chart_name, ())
+        and entry.version not in auto_excluded_versions.get(entry.chart_name, {})
     ]
 
     if not latest_only:

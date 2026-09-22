@@ -55,10 +55,16 @@ class HelmChartRemote(Remote, AutoAddObjPermsMixin):
 
     TYPE = "helmchart"
 
+    CHECKSUM_MISMATCH_POLICIES = [(value, value) for value in ("fail", "skip", "exclude")]
+
     include_charts = models.JSONField(default=list)
     exclude_charts = models.JSONField(default=list)
-    include_versions = models.JSONField(default=list)
-    exclude_versions = models.JSONField(default=list)
+    include_versions = models.JSONField(default=dict)
+    exclude_versions = models.JSONField(default=dict)
+    checksum_mismatch_policy = models.CharField(
+        max_length=7, choices=CHECKSUM_MISMATCH_POLICIES, default="fail"
+    )
+    auto_excluded_versions = models.JSONField(default=dict)
     latest_only = models.BooleanField(default=False)
     ignore_unavailable = models.BooleanField(default=True)
 

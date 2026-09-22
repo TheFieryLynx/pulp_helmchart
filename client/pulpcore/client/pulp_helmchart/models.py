@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import pprint
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 from typing_extensions import Self
@@ -151,8 +151,10 @@ class HelmchartHelmchartRemote(_Model):
     rate_limit: int | None = None
     include_charts: list[str] | None = None
     exclude_charts: list[str] | None = None
-    include_versions: list[str] | None = None
-    exclude_versions: list[str] | None = None
+    include_versions: dict[str, list[str]] | None = None
+    exclude_versions: dict[str, list[str]] | None = None
+    checksum_mismatch_policy: Literal["fail", "skip", "exclude"] | None = "fail"
+    auto_excluded_versions: dict[str, dict[str, dict[str, Any]]] | None = None
     latest_only: bool | None = False
     ignore_unavailable: bool | None = True
 
@@ -181,8 +183,10 @@ class PatchedhelmchartHelmchartRemote(_Model):
     rate_limit: int | None = None
     include_charts: list[str] | None = None
     exclude_charts: list[str] | None = None
-    include_versions: list[str] | None = None
-    exclude_versions: list[str] | None = None
+    include_versions: dict[str, list[str]] | None = None
+    exclude_versions: dict[str, list[str]] | None = None
+    checksum_mismatch_policy: Literal["fail", "skip", "exclude"] | None = None
+    auto_excluded_versions: dict[str, dict[str, dict[str, Any]]] | None = None
     latest_only: bool | None = None
     ignore_unavailable: bool | None = None
 

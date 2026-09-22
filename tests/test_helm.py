@@ -6,6 +6,7 @@ import yaml
 
 from pulp_helmchart.helm import (
     HelmChartError,
+    RepositoryChartEntry,
     filter_repository_entries,
     index_from_entries,
     parse_chart_archive,
@@ -178,13 +179,63 @@ def test_filter_repository_entries_excludes_versions_after_include():
     selected = filter_repository_entries(
         entries,
         include_charts=["gpu-operator"],
-        include_versions=["v26.3.3", "v26.3.2"],
-        exclude_versions=["v26.3.2"],
+        include_versions={"gpu-operator": ["v26.3.3", "v26.3.2"]},
+        exclude_versions={"gpu-operator": ["v26.3.2"]},
     )
 
     assert [(entry.chart_name, entry.version) for entry in selected] == [
         ("gpu-operator", "v26.3.3"),
     ]
+
+
+@pytest.mark.parametrize(
+    "filters, expected",
+    [
+        ({"include_versions": {"alertmanager": ["1.18.0"]}}, [0, 2]),
+        ({"include_versions": {"alertmanager": []}}, [2]),
+        ({"exclude_versions": {"alertmanager": ["1.18.0"]}}, [1, 2]),
+        ({"auto_excluded_versions": {"alertmanager": {"1.18.0": {}}}}, [1, 2]),
+        ({"include_versions": {}, "exclude_versions": {}}, [0, 1, 2]),
+        ({"include_versions": {"*": ["1.17.0"]}}, [1]),
+        ({"include_versions": {"*": ["1.17.0"], "alertmanager": ["1.18.0"]}}, [0]),
+        ({"include_versions": {"*": ["1.18.0"], "alertmanager": []}}, [2]),
+        ({"exclude_versions": {"*": ["1.18.0"]}}, [1]),
+        ({"exclude_versions": {"*": ["1.18.0"], "alertmanager": ["1.17.0"]}}, []),
+        ({"exclude_versions": {"*": ["1.18.0"], "alertmanager": []}}, [1]),
+        (
+            {
+                "include_versions": {"alertmanager": ["1.18.0"]},
+                "exclude_versions": {"alertmanager": ["1.18.0"]},
+            },
+            [2],
+        ),
+        (
+            {
+                "auto_excluded_versions": {"alertmanager": {"1.18.0": {}}},
+                "latest_only": True,
+            },
+            [1, 2],
+        ),
+        (
+            {
+                "include_charts": ["alertmanager"],
+                "exclude_charts": ["alertmanager"],
+                "include_versions": {"alertmanager": ["1.18.0"]},
+            },
+            [],
+        ),
+    ],
+)
+def test_version_filters_are_scoped_to_chart(filters, expected):
+    entries = [
+        RepositoryChartEntry(name, version, ["chart.tgz"], None, {})
+        for name, version in [
+            ("alertmanager", "1.18.0"),
+            ("alertmanager", "1.17.0"),
+            ("other-chart", "1.18.0"),
+        ]
+    ]
+    assert filter_repository_entries(entries, **filters) == [entries[i] for i in expected]
 
 
 def _repository_entries():

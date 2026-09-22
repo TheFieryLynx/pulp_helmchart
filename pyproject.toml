@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pulp-helmchart"
-version = "0.2.0.dev0"
+version = "0.2.0.dev1"
 description = "Pulp plugin for classic Helm chart repositories"
 readme = "README.md"
 authors = [

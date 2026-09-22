@@ -198,6 +198,19 @@ class HelmChartContentUploadSerializer(HelmChartContentSerializer):
         ref_name = "HelmChartContentUploadSerializer"
 
 
+class AutoExcludedVersionSerializer(serializers.Serializer):
+    """Diagnostic metadata retained until explicitly removed from a remote."""
+
+    reason = serializers.ChoiceField(choices=["checksum_mismatch"])
+    expected = serializers.CharField()
+    actual = serializers.CharField()
+    url = serializers.CharField()
+    timestamp = serializers.DateTimeField()
+
+    def validate_timestamp(self, value):
+        return value.isoformat()
+
+
 class HelmChartRemoteSerializer(RemoteSerializer):
     """
     Serializer for classic Helm chart remotes.
@@ -223,17 +236,39 @@ class HelmChartRemoteSerializer(RemoteSerializer):
         default=list,
         help_text=_("Optional list of chart names to skip after include_charts is applied."),
     )
-    include_versions = serializers.ListField(
-        child=serializers.CharField(),
+    include_versions = serializers.DictField(
+        child=serializers.ListField(child=serializers.CharField()),
         required=False,
-        default=list,
-        help_text=_("Optional list of chart versions to sync. Empty means all versions."),
+        default=dict,
+        help_text=_(
+            "Chart names mapped to exact versions to sync. '*' is a global fallback overridden "
+            "by chart-specific entries. Without either key, all versions are eligible; "
+            "an empty list selects no versions."
+        ),
     )
-    exclude_versions = serializers.ListField(
-        child=serializers.CharField(),
+    exclude_versions = serializers.DictField(
+        child=serializers.ListField(child=serializers.CharField()),
         required=False,
-        default=list,
-        help_text=_("Optional list of chart versions to skip after include_versions is applied."),
+        default=dict,
+        help_text=_(
+            "Chart names mapped to exact versions to skip after include_versions. "
+            "'*' exclusions are combined with chart-specific exclusions."
+        ),
+    )
+    checksum_mismatch_policy = serializers.ChoiceField(
+        choices=HelmChartRemote.CHECKSUM_MISMATCH_POLICIES,
+        required=False,
+        default="fail",
+        help_text=_("On checksum mismatch: fail, skip this sync, or exclude from future syncs."),
+    )
+    auto_excluded_versions = serializers.DictField(
+        child=serializers.DictField(child=AutoExcludedVersionSerializer()),
+        required=False,
+        default=dict,
+        help_text=_(
+            "Automatic exclusions keyed by chart name and version with checksum diagnostics. "
+            "PATCH with {} to clear all, or supply the complete mapping with entries removed."
+        ),
     )
     latest_only = serializers.BooleanField(
         required=False,
@@ -252,6 +287,8 @@ class HelmChartRemoteSerializer(RemoteSerializer):
             "exclude_charts",
             "include_versions",
             "exclude_versions",
+            "checksum_mismatch_policy",
+            "auto_excluded_versions",
             "latest_only",
             "ignore_unavailable",
         )

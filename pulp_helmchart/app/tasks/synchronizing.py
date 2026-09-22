@@ -3,6 +3,7 @@ import os
 from gettext import gettext as _
 from urllib.parse import unquote, urlparse
 
+from django.db import transaction
 from django.utils import timezone
 
 from pulpcore.plugin.files import PulpTemporaryUploadedFile
@@ -47,8 +48,6 @@ def synchronize(remote_pk, repository_pk):
     with open(index_result.path, "rb") as index_file:
         all_entries = parse_repository_index(index_file)
     entries = _filter_entries(all_entries, remote)
-    if not entries:
-        raise ValueError(_("No Helm chart entries matched the remote sync filters."))
 
     synced_content = []
     skipped_unavailable = []
@@ -58,6 +57,9 @@ def synchronize(remote_pk, repository_pk):
 
     with repository.new_version() as new_version:
         for entry in entries:
+            # Also skip repeated index entries excluded earlier in this sync.
+            if entry.version in remote.auto_excluded_versions.get(entry.chart_name, {}):
+                continue
             chart_url = resolve_chart_url(remote.url, entry.urls[0])
             filename = _chart_filename(chart_url, entry.chart_name, entry.version)
             try:
@@ -83,7 +85,16 @@ def synchronize(remote_pk, repository_pk):
                     continue
                 raise
             chart_digest = _sha256_path(chart_result.path)
-            verify_sha256_digest(entry.digest, chart_digest, chart_url)
+            try:
+                verify_sha256_digest(entry.digest, chart_digest, chart_url)
+            except HelmChartError as exc:
+                message = f"Chart {entry.chart_name!r} version {entry.version!r}: {exc}"
+                if remote.checksum_mismatch_policy not in {"skip", "exclude"}:
+                    raise HelmChartError(message) from exc
+                log.warning("Skipping Helm chart with checksum mismatch: %s", message)
+                if remote.checksum_mismatch_policy == "exclude":
+                    _record_auto_exclusion(remote, entry, chart_url, chart_digest)
+                continue
 
             with open(chart_result.path, "rb") as chart_file:
                 uploaded = PulpTemporaryUploadedFile.from_file(chart_file)
@@ -142,8 +153,28 @@ def _filter_entries(entries, remote):
         exclude_charts=remote.exclude_charts,
         include_versions=remote.include_versions,
         exclude_versions=remote.exclude_versions,
+        auto_excluded_versions=remote.auto_excluded_versions,
         latest_only=remote.latest_only,
     )
+
+
+def _record_auto_exclusion(remote, entry, url, actual):
+    """Merge under a row lock so concurrent syncs cannot overwrite each other's entries."""
+    metadata = {
+        "reason": "checksum_mismatch",
+        "expected": entry.digest.removeprefix("sha256:"),
+        "actual": actual,
+        "url": url,
+    }
+    with transaction.atomic():
+        locked = HelmChartRemote.objects.select_for_update().get(pk=remote.pk)
+        exclusions = locked.auto_excluded_versions
+        versions = exclusions.setdefault(entry.chart_name, {})
+        previous = versions.get(entry.version, {})
+        if any(previous.get(key) != value for key, value in metadata.items()):
+            versions[entry.version] = {**metadata, "timestamp": timezone.now().isoformat()}
+            locked.save(update_fields=["auto_excluded_versions"])
+        remote.auto_excluded_versions = exclusions
 
 
 def _http_status(exc):
