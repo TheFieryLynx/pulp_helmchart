@@ -1,9 +1,12 @@
-from django.db import transaction
+import os
+
 from django_filters import CharFilter
 from drf_spectacular.utils import extend_schema
-from rest_framework import status
 from rest_framework.decorators import action
-from rest_framework.response import Response
+from rest_framework.exceptions import PermissionDenied, ValidationError
+
+from pulpcore.app import tasks as core_tasks
+from pulpcore.app.global_access_conditions import has_model_or_domain_perms
 
 from pulpcore.plugin.actions import ModifyRepositoryActionMixin
 from pulpcore.plugin.serializers import AsyncOperationResponseSerializer
@@ -20,6 +23,8 @@ from pulpcore.plugin.viewsets import (
     SingleArtifactContentUploadViewSet,
 )
 
+from pulp_helmchart.helm import HelmChartError, parse_chart_archive
+
 from . import tasks
 from .models import (
     HelmChartContent,
@@ -34,6 +39,7 @@ from .serializers import (
     HelmChartDistributionSerializer,
     HelmChartPublicationSerializer,
     HelmChartRemoteSerializer,
+    RetryAutoExclusionSerializer,
     HelmChartRepositorySerializer,
     HelmChartRepositorySyncURLSerializer,
 )
@@ -92,6 +98,7 @@ class HelmChartContentViewSet(SingleArtifactContentUploadViewSet):
                 "effect": "allow",
                 "condition": [
                     "has_model_or_domain_perms:helmchart.upload_helmchart",
+                    "has_upload_param_model_or_domain_or_obj_perms:core.change_upload",
                 ],
             },
         ],
@@ -104,25 +111,69 @@ class HelmChartContentViewSet(SingleArtifactContentUploadViewSet):
         ],
     }
 
+    def init_content_data(self, serializer, request):
+        """Keep the uploaded filename when Pulp replaces the file with an Artifact href."""
+        file = request.data.get("file")
+        if file:
+            try:
+                parse_chart_archive(file)
+            except HelmChartError as exc:
+                raise ValidationError(str(exc)) from exc
+        payload = super().init_content_data(serializer, request)
+        if file and not payload.get("relative_path"):
+            payload["relative_path"] = os.path.basename(file.name)
+        return payload
+
     @extend_schema(
-        description="Synchronously upload a packaged Helm chart.",
+        description="Create chart content in a task, optionally reserving and modifying a repository.",
         request=HelmChartContentUploadSerializer,
-        responses={201: HelmChartContentUploadSerializer},
+        responses={202: AsyncOperationResponseSerializer},
         summary="Upload a packaged Helm chart.",
     )
-    @action(detail=False, methods=["post"], serializer_class=HelmChartContentUploadSerializer)
+    @action(
+        detail=False,
+        methods=["post"],
+        serializer_class=HelmChartContentUploadSerializer,
+    )
     def upload(self, request):
-        """Create a packaged Helm chart, optionally adding it to a repository."""
+        """Create chart content and reserve its destination repository before mutation."""
         serializer = self.get_serializer(data=request.data)
-        with transaction.atomic():
-            serializer.is_valid(raise_exception=True)
-            serializer.save()
+        serializer.is_valid(raise_exception=True)
+        repository = serializer.validated_data.get("repository")
+        if repository:
+            for permission in (
+                "helmchart.modify_helmchartrepository",
+                "helmchart.view_helmchartrepository",
+            ):
+                if not (
+                    has_model_or_domain_perms(request, self, "upload", permission)
+                    or request.user.has_perm(permission, repository.cast())
+                ):
+                    raise PermissionDenied(
+                        "Repository modify and view permissions are required."
+                    )
 
-        headers = self.get_success_headers(serializer.data)
-        return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
+        task_payload = self.init_content_data(serializer, request)
+        resources = [
+            resource
+            for resource in (serializer.validated_data.get("upload"), repository)
+            if resource
+        ]
+        task = dispatch(
+            core_tasks.base.general_create,
+            exclusive_resources=resources,
+            args=(self.queryset.model._meta.app_label, serializer.__class__.__name__),
+            kwargs={
+                "data": task_payload,
+                "context": self.get_deferred_context(request),
+            },
+        )
+        return OperationPostponedResponse(task, request)
 
 
-class HelmChartRepositoryViewSet(RepositoryViewSet, ModifyRepositoryActionMixin, RolesMixin):
+class HelmChartRepositoryViewSet(
+    RepositoryViewSet, ModifyRepositoryActionMixin, RolesMixin
+):
     """
     Helm chart repository containing packaged chart archives.
     """
@@ -234,7 +285,11 @@ class HelmChartRepositoryViewSet(RepositoryViewSet, ModifyRepositoryActionMixin,
         summary="Sync from a Helm chart remote",
         responses={202: AsyncOperationResponseSerializer},
     )
-    @action(detail=True, methods=["post"], serializer_class=HelmChartRepositorySyncURLSerializer)
+    @action(
+        detail=True,
+        methods=["post"],
+        serializer_class=HelmChartRepositorySyncURLSerializer,
+    )
     def sync(self, request, pk):
         """Synchronize a repository from a classic Helm chart remote."""
         serializer = HelmChartRepositorySyncURLSerializer(
@@ -295,6 +350,15 @@ class HelmChartRemoteViewSet(RemoteViewSet, RolesMixin):
                 ],
             },
             {
+                "action": ["retry_auto_exclusion"],
+                "principal": "authenticated",
+                "effect": "allow",
+                "condition": [
+                    "has_model_or_domain_or_obj_perms:helmchart.change_helmchartremote",
+                    "has_model_or_domain_or_obj_perms:helmchart.view_helmchartremote",
+                ],
+            },
+            {
                 "action": ["destroy"],
                 "principal": "authenticated",
                 "effect": "allow",
@@ -331,6 +395,31 @@ class HelmChartRemoteViewSet(RemoteViewSet, RolesMixin):
         ],
         "helmchart.helmchartremote_viewer": ["helmchart.view_helmchartremote"],
     }
+
+    @extend_schema(
+        description="Atomically remove one automatic checksum exclusion. Absent entries succeed.",
+        request=RetryAutoExclusionSerializer,
+        responses={202: AsyncOperationResponseSerializer},
+    )
+    @action(
+        detail=True, methods=["post"], serializer_class=RetryAutoExclusionSerializer
+    )
+    def retry_auto_exclusion(self, request, pk):
+        serializer = RetryAutoExclusionSerializer(
+            data=request.data, context={"request": request}
+        )
+        serializer.is_valid(raise_exception=True)
+        remote = self.get_object()
+        task = dispatch(
+            tasks.retry_auto_exclusion,
+            exclusive_resources=[remote],
+            kwargs={
+                "remote_pk": str(remote.pk),
+                "chart": serializer.validated_data["chart"],
+                "version": serializer.validated_data["version"],
+            },
+        )
+        return OperationPostponedResponse(task, request)
 
 
 class HelmChartRepositoryVersionViewSet(RepositoryVersionViewSet):
@@ -446,7 +535,9 @@ class HelmChartPublicationViewSet(PublicationViewSet, RolesMixin):
             "helmchart.delete_helmchartpublication",
             "helmchart.manage_roles_helmchartpublication",
         ],
-        "helmchart.helmchartpublication_viewer": ["helmchart.view_helmchartpublication"],
+        "helmchart.helmchartpublication_viewer": [
+            "helmchart.view_helmchartpublication"
+        ],
     }
 
     @extend_schema(
@@ -561,5 +652,7 @@ class HelmChartDistributionViewSet(DistributionViewSet, RolesMixin):
             "helmchart.delete_helmchartdistribution",
             "helmchart.manage_roles_helmchartdistribution",
         ],
-        "helmchart.helmchartdistribution_viewer": ["helmchart.view_helmchartdistribution"],
+        "helmchart.helmchartdistribution_viewer": [
+            "helmchart.view_helmchartdistribution"
+        ],
     }

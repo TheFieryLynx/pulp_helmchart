@@ -1,17 +1,29 @@
 import copy
 import hashlib
 import io
-import os
+import logging
+import re
 import tarfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import yaml
 
 
 CHART_YAML = "Chart.yaml"
+# Chart.yaml is normally a small text file; these generous caps prevent tiny
+# compressed uploads from expanding into unbounded metadata or tar headers.
+MAX_CHART_METADATA_SIZE = 2 * 1024 * 1024
+MAX_CHART_ARCHIVE_MEMBERS = 10_000
+log = logging.getLogger(__name__)
+_HELM_VERSION = re.compile(
+    r"^v?(?P<major>[0-9]+)(?:\.(?P<minor>[0-9]+))?"
+    r"(?:\.(?P<patch>[0-9]+))?"
+    r"(?:-(?P<prerelease>[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
+    r"(?:\+(?P<build>[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$"
+)
 
 
 class HelmChartError(ValueError):
@@ -74,12 +86,24 @@ def parse_chart_archive(fileobj) -> ChartMetadata:
     try:
         with tarfile.open(fileobj=fileobj, mode="r:gz") as archive:
             chart_member = _find_chart_yaml(archive)
+            if chart_member.size > MAX_CHART_METADATA_SIZE:
+                raise HelmChartError(
+                    f"Chart.yaml exceeds {MAX_CHART_METADATA_SIZE} decompressed bytes."
+                )
             extracted = archive.extractfile(chart_member)
             if extracted is None:
-                raise HelmChartError("Chart.yaml could not be read from the chart archive.")
-            raw_chart_yaml = extracted.read()
+                raise HelmChartError(
+                    "Chart.yaml could not be read from the chart archive."
+                )
+            raw_chart_yaml = extracted.read(MAX_CHART_METADATA_SIZE + 1)
+            if len(raw_chart_yaml) > MAX_CHART_METADATA_SIZE:
+                raise HelmChartError(
+                    f"Chart.yaml exceeds {MAX_CHART_METADATA_SIZE} decompressed bytes."
+                )
     except (tarfile.TarError, OSError) as exc:
-        raise HelmChartError("Uploaded file is not a valid gzip tar Helm chart archive.") from exc
+        raise HelmChartError(
+            "Uploaded file is not a valid gzip tar Helm chart archive."
+        ) from exc
     finally:
         fileobj.seek(position)
 
@@ -97,6 +121,12 @@ def parse_chart_archive(fileobj) -> ChartMetadata:
         raise HelmChartError("Chart.yaml must define a string 'name'.")
     if not version or not isinstance(version, str):
         raise HelmChartError("Chart.yaml must define a string 'version'.")
+    if name in {".", ".."} or any(char in name for char in ("/", "\\", "\x00")):
+        raise HelmChartError(f"Chart.yaml name {name!r} is invalid.")
+    try:
+        parse_helm_version(version)
+    except HelmChartError as exc:
+        raise HelmChartError(f"Chart.yaml version {version!r} is invalid.") from exc
 
     return ChartMetadata(
         name=name,
@@ -107,6 +137,37 @@ def parse_chart_archive(fileobj) -> ChartMetadata:
         annotations=_optional_dict(chart_yaml.get("annotations")),
         chart_yaml=_json_compatible(chart_yaml),
     )
+
+
+def parse_helm_version(version: str) -> tuple:
+    """Return Helm-compatible SemVer precedence, accepting its v/short-version coercions."""
+    match = _HELM_VERSION.fullmatch(version) if isinstance(version, str) else None
+    if not match:
+        raise HelmChartError(f"Invalid Helm chart version {version!r}.")
+    prerelease = match.group("prerelease")
+    identifiers = ()
+    if prerelease:
+        parts = prerelease.split(".")
+        if any(part.isdigit() and len(part) > 1 and part[0] == "0" for part in parts):
+            raise HelmChartError(f"Invalid Helm chart version {version!r}.")
+        identifiers = tuple(
+            (0, int(part)) if part.isdigit() else (1, part) for part in parts
+        )
+    return (
+        int(match.group("major")),
+        int(match.group("minor") or 0),
+        int(match.group("patch") or 0),
+        0 if prerelease else 1,
+        identifiers,
+    )
+
+
+def helm_version_sort_key(version: str, tie: str = "") -> tuple:
+    """Place malformed legacy versions after valid SemVer with a deterministic fallback."""
+    try:
+        return (1, *parse_helm_version(version), version, tie)
+    except HelmChartError:
+        return (0, str(version), tie)
 
 
 def parse_repository_index(fileobj) -> list[RepositoryChartEntry]:
@@ -120,7 +181,9 @@ def parse_repository_index(fileobj) -> list[RepositoryChartEntry]:
         raise HelmChartError("Helm repository index.yaml must be a YAML mapping.")
     entries = index.get("entries")
     if not isinstance(entries, dict):
-        raise HelmChartError("Helm repository index.yaml must define an 'entries' mapping.")
+        raise HelmChartError(
+            "Helm repository index.yaml must define an 'entries' mapping."
+        )
 
     parsed: list[RepositoryChartEntry] = []
     for chart_name in sorted(entries):
@@ -140,17 +203,27 @@ def parse_repository_index(fileobj) -> list[RepositoryChartEntry]:
                 raise HelmChartError(
                     f"Helm repository index entry for '{chart_name}' is missing string version."
                 )
-            if not isinstance(urls, list) or not urls or not isinstance(urls[0], str):
+            if (
+                not isinstance(urls, list)
+                or not urls
+                or any(not isinstance(url, str) for url in urls)
+            ):
                 raise HelmChartError(
                     f"Helm repository index entry for '{chart_name}' version '{version}' "
-                    "must include at least one URL."
+                    "must include a list of URL strings."
+                )
+            urls = [url for url in urls if url.strip()]
+            if not urls:
+                raise HelmChartError(
+                    f"Helm repository index entry for '{chart_name}' version '{version}' "
+                    "has no non-empty chart URL."
                 )
             digest = entry.get("digest")
             parsed.append(
                 RepositoryChartEntry(
                     chart_name=str(entry.get("name") or chart_name),
                     version=version,
-                    urls=[str(url) for url in urls],
+                    urls=urls,
                     digest=str(digest) if digest else None,
                     raw=_json_compatible(entry),
                 )
@@ -161,15 +234,100 @@ def parse_repository_index(fileobj) -> list[RepositoryChartEntry]:
 
 def repository_index_url(remote_url: str) -> str:
     """Return the index URL for a classic Helm repository remote URL."""
-    if remote_url.rstrip("/").endswith("/index.yaml"):
-        return remote_url
-    return urljoin(remote_url.rstrip("/") + "/", "index.yaml")
+    parts = urlsplit(remote_url)
+    if parts.path.endswith("/index.yaml"):
+        return urlunsplit(parts._replace(fragment=""))
+
+    base_path = parts.path or "/"
+    if not base_path.endswith("/"):
+        base_path += "/"
+    base = urlunsplit((parts.scheme, parts.netloc, base_path, "", ""))
+    index = urlsplit(urljoin(base, "index.yaml"))
+    return urlunsplit(index._replace(query=parts.query))
 
 
 def resolve_chart_url(remote_url: str, chart_url: str) -> str:
-    """Resolve a chart archive URL from an upstream Helm index entry."""
-    base = remote_url if remote_url.rstrip("/").endswith("/index.yaml") else remote_url.rstrip("/") + "/"
-    return urljoin(base, chart_url)
+    """Resolve archives beside index.yaml without inheriting its auth query."""
+    return urljoin(repository_index_url(remote_url), chart_url)
+
+
+def redact_url(url: str) -> str:
+    """Remove URL credentials, query parameters and fragments from diagnostics."""
+    try:
+        parsed = urlsplit(url)
+        hostname = parsed.hostname or ""
+        if ":" in hostname:
+            hostname = f"[{hostname}]"
+        if parsed.port is not None:
+            hostname = f"{hostname}:{parsed.port}"
+        return urlunsplit((parsed.scheme, hostname, parsed.path, "", ""))
+    except ValueError:
+        return "<invalid URL>"
+
+
+def normalize_chart_host(host: str) -> str:
+    """Validate and normalize an exact DNS hostname or IPv4 address allowlist entry."""
+    if not isinstance(host, str) or not host or host != host.strip():
+        raise ValueError("Chart hosts must be non-empty hostnames.")
+    normalized = host.lower().rstrip(".")
+    if len(normalized) > 253 or not all(
+        re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+        for label in normalized.split(".")
+    ):
+        raise ValueError(
+            "Chart hosts must be hostnames without a scheme, path, or port."
+        )
+    return normalized
+
+
+def validate_chart_url(
+    remote_url: str,
+    chart_url: str,
+    allowed_chart_hosts: list[str] | None = None,
+    *,
+    base_url: str | None = None,
+) -> str:
+    """Resolve a chart or redirect URL against the remote's explicit origin trust policy."""
+    try:
+        source = urlsplit(remote_url)
+        candidate = urlsplit(chart_url)
+        resolved = (
+            urljoin(base_url, chart_url)
+            if base_url
+            else resolve_chart_url(remote_url, chart_url)
+        )
+        target = urlsplit(resolved)
+        if target.scheme.lower() not in {"http", "https"} or not target.hostname:
+            raise ValueError("Only HTTP and HTTPS chart URLs are supported.")
+        if (
+            candidate.username
+            or candidate.password
+            or target.username
+            or target.password
+        ):
+            raise ValueError("Credentials in chart URLs are not allowed.")
+        source_origin = _http_origin(source)
+        target_origin = _http_origin(target)
+    except ValueError as exc:
+        raise HelmChartError(
+            f"Unsafe chart URL {redact_url(chart_url)!r}: {exc}"
+        ) from None
+    if source_origin != target_origin:
+        allowed = set(allowed_chart_hosts or ())
+        hostname = target.hostname.lower().rstrip(".")
+        if hostname not in allowed:
+            raise HelmChartError(
+                f"Chart URL {redact_url(chart_url)!r} is outside the configured remote origin "
+                "or allowed_chart_hosts."
+            )
+    return resolved
+
+
+def _http_origin(parts):
+    port = parts.port
+    if port is None:
+        port = 443 if parts.scheme.lower() == "https" else 80
+    return (parts.scheme.lower(), parts.hostname.lower().rstrip("."), port)
 
 
 def verify_sha256_digest(expected: str | None, actual: str, url: str) -> None:
@@ -188,16 +346,16 @@ def filter_repository_entries(
     *,
     include_charts: list[str] | None = None,
     exclude_charts: list[str] | None = None,
-    include_versions: dict[str, list[str]] | None = None,
-    exclude_versions: dict[str, list[str]] | None = None,
+    include_versions: dict[str, list[str]] | list[str] | None = None,
+    exclude_versions: dict[str, list[str]] | list[str] | None = None,
     auto_excluded_versions: dict[str, dict[str, Any]] | None = None,
     latest_only: bool = False,
 ) -> list[RepositoryChartEntry]:
     """Filter parsed Helm repository entries deterministically."""
     include_chart_names = set(include_charts or [])
     exclude_chart_names = set(exclude_charts or [])
-    include_version_names = {name: set(versions) for name, versions in (include_versions or {}).items()}
-    exclude_version_names = {name: set(versions) for name, versions in (exclude_versions or {}).items()}
+    include_version_names = _version_filter_sets(include_versions)
+    exclude_version_names = _version_filter_sets(exclude_versions)
     auto_excluded_versions = auto_excluded_versions or {}
 
     selected = [
@@ -206,8 +364,12 @@ def filter_repository_entries(
         if (not include_chart_names or entry.chart_name in include_chart_names)
         and entry.chart_name not in exclude_chart_names
         and (
-            (entry.chart_name not in include_version_names and "*" not in include_version_names)
-            or entry.version in include_version_names.get(
+            (
+                entry.chart_name not in include_version_names
+                and "*" not in include_version_names
+            )
+            or entry.version
+            in include_version_names.get(
                 entry.chart_name, include_version_names.get("*", ())
             )
         )
@@ -219,17 +381,34 @@ def filter_repository_entries(
     if not latest_only:
         return selected
 
-    latest = []
-    seen = set()
+    latest_by_chart = {}
     for entry in selected:
-        if entry.chart_name in seen:
-            continue
-        seen.add(entry.chart_name)
-        latest.append(entry)
-    return latest
+        previous = latest_by_chart.get(entry.chart_name)
+        if previous is None or helm_version_sort_key(
+            entry.version
+        ) > helm_version_sort_key(previous.version):
+            latest_by_chart[entry.chart_name] = entry
+    return list(latest_by_chart.values())
 
 
-def index_from_entries(entries: list[dict[str, Any]], generated: str | None = None) -> str:
+def _version_filter_sets(
+    value: dict[str, list[str]] | list[str] | None,
+) -> dict[str, set[str]]:
+    """Accept legacy global lists as equivalent to a wildcard mapping during upgrades."""
+    if value is None:
+        return {}
+    if isinstance(value, list):
+        value = {"*": value} if value else {}
+    if not isinstance(value, dict):
+        raise HelmChartError(
+            "Version filters must be lists or chart-to-version mappings."
+        )
+    return {name: set(versions) for name, versions in value.items()}
+
+
+def index_from_entries(
+    entries: list[dict[str, Any]], generated: str | None = None
+) -> str:
     """Render a deterministic classic Helm repository ``index.yaml`` document."""
     generated = generated or utc_timestamp()
     grouped: dict[str, list[dict[str, Any]]] = {}
@@ -243,9 +422,20 @@ def index_from_entries(entries: list[dict[str, Any]], generated: str | None = No
     }
 
     for name in sorted(grouped):
+        for item in grouped[name]:
+            try:
+                parse_helm_version(item.get("version"))
+            except HelmChartError:
+                log.warning(
+                    "Publishing legacy chart %s with invalid version %r after valid versions.",
+                    name,
+                    item.get("version"),
+                )
         rendered["entries"][name] = sorted(
             grouped[name],
-            key=lambda item: (item.get("version") or "", item.get("digest") or ""),
+            key=lambda item: helm_version_sort_key(
+                item.get("version"), item.get("digest") or ""
+            ),
             reverse=True,
         )
 
@@ -287,15 +477,39 @@ def build_index_entry(
 
 
 def _find_chart_yaml(archive: tarfile.TarFile) -> tarfile.TarInfo:
-    matches = [
-        member
-        for member in archive.getmembers()
-        if member.isfile() and os.path.basename(member.name) == CHART_YAML
-    ]
-    if not matches:
-        raise HelmChartError("Chart.yaml was not found in the chart archive.")
-    matches.sort(key=lambda member: (member.name.count("/"), member.name))
-    return matches[0]
+    root = None
+    chart_members = []
+    for member_count, member in enumerate(archive, start=1):
+        if member_count > MAX_CHART_ARCHIVE_MEMBERS:
+            raise HelmChartError(
+                f"Chart archive exceeds {MAX_CHART_ARCHIVE_MEMBERS} tar members."
+            )
+        path = member.name.rstrip("/") if member.isdir() else member.name
+        parts = path.split("/")
+        if (
+            path.startswith("/")
+            or len(parts) < 1
+            or any(part in {"", ".", ".."} for part in parts)
+            or "\\" in path
+        ):
+            raise HelmChartError(f"Unsafe chart archive member path {member.name!r}.")
+        if root is None:
+            root = parts[0]
+        elif parts[0] != root:
+            raise HelmChartError(
+                "Chart archive must contain exactly one chart root directory."
+            )
+        if len(parts) == 1 and not member.isdir():
+            raise HelmChartError(
+                "Chart archive files must be inside the chart root directory."
+            )
+        if len(parts) == 2 and parts[1] == CHART_YAML and member.isfile():
+            chart_members.append(member)
+    if len(chart_members) != 1:
+        raise HelmChartError(
+            "Chart archive must contain exactly one Chart.yaml directly under its chart root."
+        )
+    return chart_members[0]
 
 
 def _optional_str(value: Any) -> str | None:
@@ -308,7 +522,9 @@ def _optional_dict(value: Any) -> dict[str, Any] | None:
     if value is None:
         return None
     if not isinstance(value, dict):
-        raise HelmChartError("Chart.yaml 'annotations' must be a YAML mapping when present.")
+        raise HelmChartError(
+            "Chart.yaml 'annotations' must be a YAML mapping when present."
+        )
     return _json_compatible(value)
 
 

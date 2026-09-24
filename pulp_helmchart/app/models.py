@@ -38,13 +38,18 @@ class HelmChartContent(Content):
     digest = models.CharField(max_length=64, null=False)
     filename = models.TextField(null=False)
     chart_yaml = models.JSONField(default=dict)
-    _pulp_domain = models.ForeignKey("core.Domain", default=get_domain_pk, on_delete=models.PROTECT)
+    _pulp_domain = models.ForeignKey(
+        "core.Domain", default=get_domain_pk, on_delete=models.PROTECT
+    )
 
     class Meta:
         default_related_name = "%(app_label)s_%(model_name)s"
         unique_together = ("name", "version", "digest", "_pulp_domain")
         permissions = [
-            ("upload_helmchart", "Can upload Helm chart content using synchronous API."),
+            (
+                "upload_helmchart",
+                "Can upload Helm chart content using synchronous API.",
+            ),
         ]
 
 
@@ -55,10 +60,13 @@ class HelmChartRemote(Remote, AutoAddObjPermsMixin):
 
     TYPE = "helmchart"
 
-    CHECKSUM_MISMATCH_POLICIES = [(value, value) for value in ("fail", "skip", "exclude")]
+    CHECKSUM_MISMATCH_POLICIES = [
+        (value, value) for value in ("fail", "skip", "exclude")
+    ]
 
     include_charts = models.JSONField(default=list)
     exclude_charts = models.JSONField(default=list)
+    allowed_chart_hosts = models.JSONField(default=list, blank=True)
     include_versions = models.JSONField(default=dict)
     exclude_versions = models.JSONField(default=dict)
     checksum_mismatch_policy = models.CharField(
@@ -90,9 +98,15 @@ class HelmChartRepository(Repository, AutoAddObjPermsMixin):
     class Meta:
         default_related_name = "%(app_label)s_%(model_name)s"
         permissions = [
-            ("modify_helmchartrepository", "Can modify content of the Helm chart repository"),
+            (
+                "modify_helmchartrepository",
+                "Can modify content of the Helm chart repository",
+            ),
             ("sync_helmchartrepository", "Can sync the Helm chart repository"),
-            ("manage_roles_helmchartrepository", "Can manage roles on Helm chart repositories"),
+            (
+                "manage_roles_helmchartrepository",
+                "Can manage roles on Helm chart repositories",
+            ),
             ("repair_helmchartrepository", "Can repair repository versions"),
         ]
 
@@ -105,7 +119,9 @@ class HelmChartRepository(Repository, AutoAddObjPermsMixin):
         from pulp_helmchart.app import tasks
 
         if self.autopublish:
-            tasks.publish(repository_version_pk=version.pk, record_created_resource=False)
+            tasks.publish(
+                repository_version_pk=version.pk, record_created_resource=False
+            )
 
     def finalize_new_version(self, new_version):
         """
@@ -127,7 +143,10 @@ class HelmChartPublication(Publication, AutoAddObjPermsMixin):
     class Meta:
         default_related_name = "%(app_label)s_%(model_name)s"
         permissions = [
-            ("manage_roles_helmchartpublication", "Can manage roles on Helm chart publications"),
+            (
+                "manage_roles_helmchartpublication",
+                "Can manage roles on Helm chart publications",
+            ),
         ]
 
     def finalize_new_publication(self):
@@ -148,5 +167,8 @@ class HelmChartDistribution(Distribution, AutoAddObjPermsMixin):
     class Meta:
         default_related_name = "%(app_label)s_%(model_name)s"
         permissions = [
-            ("manage_roles_helmchartdistribution", "Can manage roles on Helm chart distributions"),
+            (
+                "manage_roles_helmchartdistribution",
+                "Can manage roles on Helm chart distributions",
+            ),
         ]

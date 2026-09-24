@@ -36,7 +36,15 @@ If your CLI exposes the upload action separately, use:
 pulp helmchart chart upload --file gpu-operator-v26.3.3.tgz
 ```
 
-and then add the returned content to a repository with the repository `modify` action.
+The upload returns a Pulp task (HTTP 202). Wait for it to complete and read the created
+content href from its created resources. Supplying `repository` requires both repository
+`modify` and `view` permissions; Pulp reserves that repository for the upload task.
+Archives must have one chart root with `Chart.yaml` directly beneath it and a valid Helm chart
+name and semantic version. Helm-compatible prerelease, build metadata, short versions, and
+`v`-prefixed versions retain their original spelling. Invalid packages create no chart content.
+`Chart.yaml` is limited to 2 MiB after decompression, and an archive may contain at most
+10,000 tar members. These generous limits bound metadata parsing and publication index size.
+Using an existing Pulp Upload also requires `core.change_upload` permission on that Upload.
 
 ## Manual Helm validation
 
@@ -51,18 +59,22 @@ helm pull nvidia/gpu-operator --version v26.3.3
 Upload/publish/distribute it through Pulp, then verify:
 
 ```bash
-helm repo add nvidia-pulp https://mirror.intra.acloud.ru/pulp/content/helm/nvidia
+helm repo add nvidia-pulp "$DISTRIBUTION_BASE_URL"
 helm repo update
 helm search repo nvidia-pulp/gpu-operator --versions
 helm template gpu-operator nvidia-pulp/gpu-operator --version v26.3.3
 ```
 
-Expected content paths:
+For a distribution whose returned `base_url` is
+`https://mirror.intra.acloud.ru/repos/helm/nvidia/`, the content paths are:
 
 ```text
-/pulp/content/helm/nvidia/index.yaml
-/pulp/content/helm/nvidia/gpu-operator-v26.3.3.tgz
+/repos/helm/nvidia/index.yaml
+/repos/helm/nvidia/gpu-operator-v26.3.3.tgz
 ```
+
+Always use the distribution's `base_url`; the content prefix is configurable per Pulp
+deployment.
 
 ## Implementation notes
 
@@ -76,6 +88,15 @@ urls:
   - gpu-operator-v26.3.3.tgz
 ```
 
+Helm publications always place `index.yaml` at the distribution root alongside chart archives.
+Requests to publish at a nested index path are rejected. Publications accept only Helm chart
+repositories or their versions; distributions accept only Helm chart repositories, versions,
+or publications. Existing historical records remain readable.
+
+For each chart, generated index entries are ordered by Helm-compatible semantic version
+precedence, newest first. Build metadata does not affect precedence; stored version text is
+preserved. Legacy content with an invalid version sorts after valid versions with a warning.
+
 ## Sync remote configuration
 
 Create a remote with `POST /pulp/api/v3/remotes/helmchart/helmchart/`, or update its
@@ -85,6 +106,8 @@ returned `pulp_href` with `PATCH`. For example:
 {
   "name": "public-charts",
   "url": "https://prometheus-community.github.io/helm-charts/",
+  "policy": "immediate",
+  "allowed_chart_hosts": ["github.com", "release-assets.githubusercontent.com"],
   "max_retries": 8,
   "ignore_unavailable": true,
   "checksum_mismatch_policy": "exclude",
@@ -96,8 +119,38 @@ returned `pulp_href` with `PATCH`. For example:
 `max_retries` is inherited from pulpcore's `Remote` and already exposed by the standard
 remote serializer. Both index and archive downloads use pulpcore's HTTP downloader, including
 its exponential backoff for HTTP 5xx/429, connection failures, and timeouts. There is no plugin
-retry loop. A final failure propagates and fails sync. `ignore_unavailable` (default `true`)
-only allows skipping archive HTTP 403, 404, and 410; it never skips 5xx or checksum failures.
+retry loop. Helm remotes support only `policy: immediate`; `on_demand` and `streamed` are rejected.
+An older remote stored with either unsupported policy fails before its index is downloaded.
+
+If an index entry lists multiple archive URLs, sync tries them in declared order. Blank URLs are
+discarded. Unsafe URLs are rejected individually, and an unavailable or retry-exhausted URL can
+fall back to the next safe URL. Once bytes download successfully, a digest mismatch applies the
+configured checksum policy immediately; sync does not try another URL for that mismatch. If all
+candidates fail, sync fails except when every attempted download returned HTTP 403, 404, or 410
+and `ignore_unavailable` (default `true`) is enabled. Rejected URLs alone never cause a skip.
+The published archive filename comes from the first URL allowed by the remote policy, so a
+preferred mirror recovering later does not change an existing chart content path.
+
+By default, a Helm remote downloads charts only from its own origin (same scheme, hostname,
+and port). Relative chart URLs and absolute same-origin HTTP(S) URLs work without configuration.
+Some public Helm repositories host archives elsewhere: Prometheus Community uses `github.com`,
+which redirects release downloads to `release-assets.githubusercontent.com`. List **both** exact
+hostnames in `allowed_chart_hosts` to trust that download chain. The field defaults to `[]`;
+hostnames are case-insensitive and match exactly, with no wildcard or subdomain matching. The
+allowlist trusts HTTP(S) on any port of a listed hostname. Every redirect is checked against
+the remote origin and this list; an unlisted host, unsupported scheme, embedded URL credentials,
+redirect loop, or excessive redirect chain is rejected. The configured remote's Basic Auth,
+custom headers (including cookies and tokens), client certificate, and proxy credentials are
+used only for same-origin requests. Cross-origin downloads use pulpcore retry, timeout, and TLS
+settings with no custom remote headers or proxy. If a trusted host needs its own authentication,
+use a separate remote pointed at that origin. URLs written to checksum diagnostics omit embedded
+credentials, query parameters, and fragments.
+
+A remote URL may point directly at `index.yaml?token=...` or at a repository base URL with a
+query token. The index request retains that query. Relative chart URLs resolve against the
+index path **without inheriting its query token**; chart archive URLs must include their own
+query authentication if required. The token is never copied to another origin. Remote URL
+queries are redacted from sync diagnostics.
 
 Filters apply in this order: `include_charts`, `exclude_charts`, `include_versions`,
 `exclude_versions`, then `auto_excluded_versions`. Chart-name lists use exact matches; an
@@ -131,9 +184,13 @@ combined. With neither key present, that filter imposes no version restriction:
 }
 ```
 
-`latest_only`, when enabled, keeps the first eligible index entry per chart after these
-filters. If no entries remain, sync completes without adding content. Sync is additive:
+`latest_only`, when enabled, selects the highest semantic version per chart after these
+filters, regardless of upstream entry order. Prereleases remain eligible and compare by SemVer
+precedence; there is no stable-only mode. If no entries remain, sync completes without adding
+content. Sync is additive:
 filters and checksum policies do not remove content already present in the repository.
+Sync task progress reports show index parsing, selected versions, chart downloads, skips,
+automatic exclusions, and created or reused content. Downloads remain serial.
 
 ### Checksum policy and recovery
 
@@ -174,17 +231,40 @@ To retry all automatically excluded versions, PATCH the remote with:
 {"auto_excluded_versions": {}}
 ```
 
-For a targeted retry, GET the remote, remove the desired chart/version entry from its
-`auto_excluded_versions`, then PATCH the complete remaining mapping. This replaces that JSON
-field rather than merging it. Manual exclusions still apply. No automatic exclusion is removed
-just because the upstream artifact or digest changes.
+For a targeted retry, POST to `<remote pulp_href>retry_auto_exclusion/` with
+`{"chart": "alertmanager", "version": "1.18.0"}`. This returns a Pulp task (HTTP 202).
+The task reserves the remote and removes only that chart/version from the latest stored
+mapping. Repeating the action after the entry is absent succeeds. Manual exclusions still
+apply. General PATCH of the complete mapping remains available for administrative changes;
+it replaces the JSON field and should not be used for targeted retries during sync.
 
-Migration `0006_remote_sync_policies` converts empty legacy global version lists to `{}` and
-nonempty lists to `{"*": [...]}`, preserving their global scope. It adds the policy and
-automatic-exclusion fields; existing remotes default to `fail` with no automatic exclusions.
-Run the normal `pulpcore-manager migrate` during upgrade. Existing migrations are unchanged.
+### Content with multiple archive paths
+
+Each chart content object has one canonical archive filename. Uploading identical bytes under
+another filename is rejected. If an older installation already has multiple `ContentArtifact`
+paths for one chart, reuse and publication fail with an ambiguity error. To repair it, first
+identify every repository and publication referencing the content, choose the intended archive
+path from the original chart filename and existing published URLs, then remove the unwanted
+`ContentArtifact` rows under an operator-controlled maintenance window. Rebuild affected
+publications after confirming their existing URLs. The plugin does not guess or delete paths.
+
+Migration `0006_remote_sync_policies` is preserved as shipped. It converts empty legacy global
+version lists to `{}` and nonempty lists to `{"*": [...]}`. New sync code understands both
+legacy lists and mappings, including legacy lists encountered during transition.
+
+**Upgrading a database that has not yet applied 0006 requires a full stop:** stop all Pulp API,
+content, and worker processes, wait for their status heartbeats to expire, install the new plugin,
+run `pulpcore-manager migrate`, and then start only processes running the new plugin. The plugin's
+pre-migration guard refuses 0006 while any Pulp process still has a live status heartbeat.
+Do not perform a rolling code/schema upgrade across 0006. On a database where 0006 is already
+applied, the guard is inactive; normal forward migrations can proceed. This guard cannot undo
+incorrect syncs that may have occurred in an earlier mixed-version deployment.
 
 ## Python SDK client
+
+The database regression tests require an isolated PostgreSQL test database and a `PULP_SETTINGS`
+file pointing to it. Run `PULP_SETTINGS=/path/to/test-settings.py pytest` to include them; plain
+`pytest` skips those integration cases when no test settings file is configured.
 
 This repository also contains `client/`, a separate installable Python package:
 

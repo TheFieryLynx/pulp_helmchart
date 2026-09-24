@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pulp-helmchart"
-version = "0.2.0.dev1"
+version = "0.2.0"
 description = "Pulp plugin for classic Helm chart repositories"
 readme = "README.md"
 authors = [
@@ -29,6 +29,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   "pytest>=8,<9",
+  "pytest-django>=4.8,<5",
 ]
 
 [project.urls]
@@ -40,7 +41,22 @@ pulp_helmchart = "pulp_helmchart:default_app_config"
 
 [tool.setuptools.packages.find]
 where = ["."]
+include = ["pulp_helmchart", "pulp_helmchart.*"]
+namespaces = false
+
+[tool.setuptools]
+include-package-data = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+
+[tool.ruff]
+# Preserve shipped migration files; formatting them would change historical migrations.
+extend-exclude = [
+  "pulp_helmchart/app/migrations/0001_initial.py",
+  "pulp_helmchart/app/migrations/0002_remote_and_sync.py",
+  "pulp_helmchart/app/migrations/0003_remote_filters.py",
+  "pulp_helmchart/app/migrations/0004_remote_unavailable_controls.py",
+  "pulp_helmchart/app/migrations/0005_remote_exclude_versions.py",
+]

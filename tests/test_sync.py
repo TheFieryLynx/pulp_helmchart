@@ -1,7 +1,10 @@
 import asyncio
+import atexit
 import copy
 import hashlib
+import threading
 from contextlib import nullcontext
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
@@ -52,6 +55,168 @@ def test_max_retries_is_inherited_and_writable():
     }
 
 
+@pytest.mark.parametrize("allow_destination", [False, True])
+@pytest.mark.parametrize("auth_mode", ["basic", "header"])
+def test_cross_host_redirect_does_not_forward_remote_credentials(
+    remote, tmp_path, monkeypatch, allow_destination, auth_mode
+):
+    monkeypatch.setattr(
+        "pulpcore.download.base.settings.WORKING_DIRECTORY", str(tmp_path)
+    )
+    received = []
+    source_received = []
+
+    class Destination(BaseHTTPRequestHandler):
+        def do_GET(self):
+            received.append(dict(self.headers))
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"chart")
+
+        def log_message(self, *_args):
+            pass
+
+    destination = ThreadingHTTPServer(("127.0.0.1", 0), Destination)
+
+    class Redirect(BaseHTTPRequestHandler):
+        def do_GET(self):
+            source_received.append(dict(self.headers))
+            self.send_response(302)
+            self.send_header(
+                "Location",
+                f"http://localhost:{destination.server_port}/chart.tgz?token=hidden#fragment",
+            )
+            self.end_headers()
+
+        def log_message(self, *_args):
+            pass
+
+    source = ThreadingHTTPServer(("127.0.0.1", 0), Redirect)
+    threads = [
+        threading.Thread(target=server.serve_forever, daemon=True)
+        for server in (source, destination)
+    ]
+    for thread in threads:
+        thread.start()
+    try:
+        remote.url = f"http://127.0.0.1:{source.server_port}/"
+        if auth_mode == "basic":
+            remote.username = "reader"
+            remote.password = "secret"
+        remote.headers = [{"Cookie": "session=private", "X-Token": "private"}]
+        if auth_mode == "header":
+            remote.headers[0]["Authorization"] = "Bearer private"
+        remote.allowed_chart_hosts = ["localhost"] if allow_destination else []
+        if allow_destination:
+            result = sync._safe_fetch(remote, remote.url + "chart.tgz")
+            assert open(result.path, "rb").read() == b"chart"
+        else:
+            with pytest.raises(HelmChartError, match="redirect") as error:
+                sync._safe_fetch(remote, remote.url + "chart.tgz")
+            assert "hidden" not in str(error.value)
+        assert source_received and "Authorization" in source_received[0]
+        if allow_destination:
+            assert len(received) == 1
+            for header in ("Authorization", "Cookie", "X-Token"):
+                assert header not in received[0]
+        else:
+            assert received == []
+    finally:
+        factory = remote.download_factory
+        asyncio.get_event_loop().run_until_complete(factory._session.close())
+        atexit.unregister(factory._session_cleanup)
+        anonymous = getattr(remote, "_anonymous_chart_factory", None)
+        if anonymous:
+            asyncio.get_event_loop().run_until_complete(anonymous._session.close())
+            atexit.unregister(anonymous._session_cleanup)
+        for server in (source, destination):
+            server.shutdown()
+            server.server_close()
+        for thread in threads:
+            thread.join(timeout=2)
+
+
+def test_same_origin_redirect_retains_remote_credentials(remote, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "pulpcore.download.base.settings.WORKING_DIRECTORY", str(tmp_path)
+    )
+    received = []
+
+    class SameOrigin(BaseHTTPRequestHandler):
+        def do_GET(self):
+            received.append((self.path, dict(self.headers)))
+            if self.path == "/path/start":
+                self.send_response(302)
+                self.send_header("Location", "archive")
+            else:
+                self.send_response(200)
+            self.end_headers()
+            if self.path == "/path/archive":
+                self.wfile.write(b"chart")
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), SameOrigin)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        remote.url = f"http://127.0.0.1:{server.server_port}/"
+        remote.username = "reader"
+        remote.password = "secret"
+        result = sync._safe_fetch(remote, remote.url + "path/start")
+        assert open(result.path, "rb").read() == b"chart"
+        assert [path for path, _ in received] == ["/path/start", "/path/archive"]
+        assert all("Authorization" in headers for _, headers in received)
+    finally:
+        factory = remote.download_factory
+        asyncio.get_event_loop().run_until_complete(factory._session.close())
+        atexit.unregister(factory._session_cleanup)
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_checksum_diagnostics_strip_url_query_secret(sync_context, caplog):
+    ctx = sync_context
+    ctx.remote.checksum_mismatch_policy = "exclude"
+    document = yaml.safe_load(ctx.index.read_text())
+    document["entries"]["alertmanager"][0]["urls"] = ["bad.tgz?token=private"]
+    ctx.index.write_text(yaml.safe_dump(document))
+    ctx.downloads["https://example.test/bad.tgz?token=private"] = ctx.downloads[
+        "https://example.test/bad.tgz"
+    ]
+
+    sync.synchronize(ctx.remote.pk, uuid4())
+
+    diagnosis = ctx.locked.auto_excluded_versions["alertmanager"]["1.18.0"]
+    assert diagnosis["url"] == "https://example.test/bad.tgz"
+    assert "private" not in caplog.text
+
+
+def test_allowed_chart_hosts_serializer_validation():
+    serializer = HelmChartRemoteSerializer(
+        data={
+            "allowed_chart_hosts": [
+                "GitHub.COM",
+                "github.com",
+                "release-assets.githubusercontent.com",
+            ]
+        },
+        partial=True,
+    )
+    assert serializer.is_valid(), serializer.errors
+    assert serializer.validated_data["allowed_chart_hosts"] == [
+        "github.com",
+        "release-assets.githubusercontent.com",
+    ]
+    for bad in (None, "github.com", [""], ["https://github.com"], ["github.com/path"]):
+        serializer = HelmChartRemoteSerializer(
+            data={"allowed_chart_hosts": bad}, partial=True
+        )
+        assert not serializer.is_valid()
+
+
 @pytest.mark.parametrize("field", ["include_versions", "exclude_versions"])
 def test_version_mapping_validation(field):
     serializer = HelmChartRemoteSerializer()
@@ -74,6 +239,19 @@ def test_checksum_policy_validation_and_defaults(remote):
     with pytest.raises(ValidationError):
         field.run_validation("accept")
     assert remote.auto_excluded_versions == {}
+
+
+def test_helm_remote_only_accepts_immediate_policy(sync_context):
+    for value in ("on_demand", "streamed"):
+        serializer = HelmChartRemoteSerializer(data={"policy": value}, partial=True)
+        assert not serializer.is_valid()
+        sync_context.remote.policy = value
+        with pytest.raises(HelmChartError, match="unsupported"):
+            sync.synchronize(sync_context.remote.pk, uuid4())
+        sync_context.remote.get_downloader.assert_not_called()
+    assert HelmChartRemoteSerializer(
+        data={"policy": "immediate"}, partial=True
+    ).is_valid()
 
 
 @pytest.mark.parametrize(
@@ -149,8 +327,9 @@ def sync_context(remote, tmp_path, monkeypatch):
         )
     )
     downloads = {
-        "https://example.test/"
-        + name: Mock(fetch=Mock(return_value=SimpleNamespace(path=path)))
+        "https://example.test/" + name: Mock(
+            fetch=Mock(return_value=SimpleNamespace(path=path))
+        )
         for name, path in [("index.yaml", index), ("bad.tgz", bad), ("good.tgz", good)]
     }
     monkeypatch.setattr(
@@ -163,7 +342,8 @@ def sync_context(remote, tmp_path, monkeypatch):
         HelmChartRemote.objects, "select_for_update", Mock(return_value=lock_query)
     )
     monkeypatch.setattr(sync.transaction, "atomic", nullcontext)
-    version = SimpleNamespace(pk=uuid4(), number=1, add_content=Mock())
+    version = SimpleNamespace(pk=uuid4(), number=1, add_content=Mock(), content=Mock())
+    version.content.filter.return_value.values_list.return_value = []
     repository = Mock()
     repository.new_version.return_value = nullcontext(version)
     repository.latest_version.return_value = version
@@ -201,6 +381,7 @@ def sync_context(remote, tmp_path, monkeypatch):
         upload=upload,
         index=index,
         bad=bad,
+        good=good,
     )
 
 
@@ -371,11 +552,93 @@ def test_final_download_failures_only_skip_unavailable(sync_context, status, ign
         sync.synchronize(ctx.remote.pk, uuid4())
         ctx.version.add_content.assert_called_once_with(["good-content"])
     else:
-        with pytest.raises(aiohttp.ClientResponseError) as raised:
+        with pytest.raises(HelmChartError, match=f"HTTP {status}"):
             sync.synchronize(ctx.remote.pk, uuid4())
-        assert raised.value is error
         ctx.create.assert_not_called()
         ctx.version.add_content.assert_not_called()
     # Sync calls fetch once; all retries belong to pulpcore.
-    downloader.fetch.assert_called_once_with()
+    downloader.fetch.assert_called_once_with(
+        extra_data={"request_kwargs": {"allow_redirects": False}}
+    )
     ctx.locked.save.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "first", ["missing.tgz", "", "https://untrusted.example/chart.tgz", "retry.tgz"]
+)
+def test_sync_tries_safe_fallback_url_after_failure(sync_context, first):
+    ctx = sync_context
+    ctx.remote.exclude_charts = ["other-chart"]
+    document = yaml.safe_load(ctx.index.read_text())
+    document["entries"]["alertmanager"][0]["urls"] = [first, "working.tgz"]
+    document["entries"]["alertmanager"][0]["digest"] = hashlib.sha256(
+        ctx.good.read_bytes()
+    ).hexdigest()
+    ctx.index.write_text(yaml.safe_dump(document))
+    ctx.downloads["https://example.test/working.tgz"] = Mock(
+        fetch=Mock(return_value=SimpleNamespace(path=ctx.good))
+    )
+    if first in {"missing.tgz", "retry.tgz"}:
+        status = 404 if first == "missing.tgz" else 503
+        ctx.downloads[f"https://example.test/{first}"] = Mock(
+            fetch=Mock(
+                side_effect=aiohttp.ClientResponseError(
+                    SimpleNamespace(real_url=f"https://example.test/{first}"),
+                    (),
+                    status=status,
+                )
+            )
+        )
+    ctx.create.return_value.content.name = "alertmanager"
+    sync.synchronize(ctx.remote.pk, uuid4())
+    ctx.create.assert_called_once()
+    expected_filename = (
+        first if first in {"missing.tgz", "retry.tgz"} else "working.tgz"
+    )
+    assert ctx.create.call_args.kwargs["relative_path"] == expected_filename
+    ctx.downloads["https://example.test/working.tgz"].fetch.assert_called_once()
+    if first == "":
+        assert "https://example.test/" not in ctx.downloads
+    if first.startswith("https://untrusted"):
+        assert "https://untrusted.example/chart.tgz" not in ctx.downloads
+
+
+@pytest.mark.parametrize("ignore", [False, True])
+def test_all_urls_unavailable_obey_ignore_unavailable(sync_context, ignore):
+    ctx = sync_context
+    ctx.remote.ignore_unavailable = ignore
+    ctx.remote.exclude_charts = ["other-chart"]
+    document = yaml.safe_load(ctx.index.read_text())
+    document["entries"]["alertmanager"][0]["urls"] = ["missing.tgz", "gone.tgz"]
+    ctx.index.write_text(yaml.safe_dump(document))
+    for name, status in (("missing.tgz", 404), ("gone.tgz", 410)):
+        ctx.downloads[f"https://example.test/{name}"] = Mock(
+            fetch=Mock(
+                side_effect=aiohttp.ClientResponseError(
+                    SimpleNamespace(real_url=f"https://example.test/{name}"),
+                    (),
+                    status=status,
+                )
+            )
+        )
+    if ignore:
+        sync.synchronize(ctx.remote.pk, uuid4())
+        assert ctx.repository.last_sync_details["charts_skipped_unavailable"] == 1
+    else:
+        with pytest.raises(HelmChartError, match="All 2 chart URLs failed"):
+            sync.synchronize(ctx.remote.pk, uuid4())
+    ctx.downloads["https://example.test/missing.tgz"].fetch.assert_called_once()
+    ctx.downloads["https://example.test/gone.tgz"].fetch.assert_called_once()
+    ctx.create.assert_not_called()
+
+
+def test_checksum_mismatch_never_falls_back_to_second_url(sync_context):
+    ctx = sync_context
+    ctx.remote.checksum_mismatch_policy = "skip"
+    ctx.remote.exclude_charts = ["other-chart"]
+    document = yaml.safe_load(ctx.index.read_text())
+    document["entries"]["alertmanager"][0]["urls"] = ["bad.tgz", "good.tgz"]
+    ctx.index.write_text(yaml.safe_dump(document))
+    sync.synchronize(ctx.remote.pk, uuid4())
+    ctx.downloads["https://example.test/bad.tgz"].fetch.assert_called_once()
+    ctx.downloads["https://example.test/good.tgz"].fetch.assert_not_called()

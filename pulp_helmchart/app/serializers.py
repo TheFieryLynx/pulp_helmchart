@@ -1,12 +1,10 @@
 import os
 from gettext import gettext as _
-from tempfile import NamedTemporaryFile
-
-from django.conf import settings
 from rest_framework import serializers
 
 from pulpcore.plugin import models
 from pulpcore.plugin.files import PulpTemporaryUploadedFile
+from pulpcore.plugin.models import UploadChunk
 from pulpcore.plugin.serializers import (
     ContentChecksumSerializer,
     DetailRelatedField,
@@ -15,6 +13,7 @@ from pulpcore.plugin.serializers import (
     RemoteSerializer,
     RepositorySerializer,
     RepositorySyncURLSerializer,
+    RepositoryVersionRelatedField,
     SingleArtifactContentUploadSerializer,
 )
 from pulpcore.plugin.util import get_domain_pk
@@ -25,7 +24,7 @@ from pulp_helmchart.helm import (
     parse_chart_archive,
 )
 
-from .content import create_helmchart_content_from_tgz
+from .content import validate_content_artifact_path
 from .models import (
     HelmChartContent,
     HelmChartDistribution,
@@ -57,9 +56,62 @@ class HelmChartContentSerializer(
 
     def deferred_validate(self, data):
         """Validate chart metadata after the uploaded file has become an Artifact."""
-        data = super().deferred_validate(data)
-        self._populate_chart_fields(data)
-        return data
+        upload = data.pop("upload", None)
+        assembled = None
+        if upload is not None:
+            self.context["upload"] = upload
+            assembled = PulpTemporaryUploadedFile(
+                "chart.tgz", "application/gzip", upload.size, None
+            )
+            try:
+                chunks = UploadChunk.objects.filter(upload=upload).order_by("offset")
+                for chunk in chunks.iterator():
+                    for part in chunk.file.chunks():
+                        assembled.write(part)
+                        for hasher in assembled.hashers.values():
+                            hasher.update(part)
+                assembled.seek(0)
+                data["file"] = assembled
+            except Exception:
+                assembled.close()
+                upload.delete()
+                raise
+        try:
+            if assembled is not None:
+                self._validate_chart_file(assembled)
+            data = super().deferred_validate(data)
+            self._populate_chart_fields(data)
+            return data
+        except Exception:
+            if upload is not None:
+                upload.delete()
+            raise
+        finally:
+            if assembled is not None:
+                assembled.close()
+
+    def download(self, url, expected_digests=None, expected_size=None):
+        file = super().download(url, expected_digests, expected_size)
+        try:
+            self._validate_chart_file(file)
+        except Exception:
+            file.close()
+            raise
+        return file
+
+    def _validate_chart_file(self, file):
+        try:
+            parse_chart_archive(file)
+        except HelmChartError as exc:
+            raise serializers.ValidationError(str(exc)) from exc
+
+    def create(self, validated_data):
+        try:
+            return super().create(validated_data)
+        finally:
+            upload = self.context.get("upload")
+            if upload is not None and upload.pk is not None:
+                upload.delete()
 
     def retrieve(self, validated_data):
         """Return existing identical chart content, or reject immutable chart replacement."""
@@ -70,6 +122,9 @@ class HelmChartContentSerializer(
         )
         same_digest = existing.filter(digest=validated_data["digest"]).first()
         if same_digest:
+            validate_content_artifact_path(
+                same_digest, self._requested_relative_path, validated_data["digest"]
+            )
             return same_digest
         if existing.exists():
             raise serializers.ValidationError(
@@ -78,6 +133,10 @@ class HelmChartContentSerializer(
                 ).format(name=validated_data["name"], version=validated_data["version"])
             )
         return None
+
+    def get_artifacts(self, validated_data):
+        self._requested_relative_path = validated_data["relative_path"]
+        return super().get_artifacts(validated_data)
 
     def _populate_chart_fields(self, data, file=None):
         artifact = data.get("artifact")
@@ -140,57 +199,7 @@ class HelmChartContentSerializer(
 
 
 class HelmChartContentUploadSerializer(HelmChartContentSerializer):
-    """
-    Synchronous upload serializer for packaged Helm charts.
-    """
-
-    def validate(self, data):
-        """Validate chart upload data and prepare the archive file for synchronous creation."""
-        data = super().validate(data)
-
-        if upload := data.pop("upload", None):
-            chunks = models.UploadChunk.objects.filter(upload=upload).order_by("offset")
-            with NamedTemporaryFile(
-                mode="ab", dir=settings.WORKING_DIRECTORY, delete=False
-            ) as temp_file:
-                for chunk in chunks:
-                    temp_file.write(chunk.file.read())
-                    chunk.file.close()
-                temp_file.flush()
-            data["file"] = PulpTemporaryUploadedFile.from_file(open(temp_file.name, "rb"))
-        elif file_url := data.pop("file_url", None):
-            expected_digests = data.get("expected_digests", None)
-            expected_size = data.get("expected_size", None)
-            data["file"] = self.download(
-                file_url, expected_digests=expected_digests, expected_size=expected_size
-            )
-
-        return data
-
-    def create(self, validated_data):
-        """Create or reuse chart content through the shared Helm chart helper."""
-        repository = validated_data.pop("repository", None)
-        relative_path = validated_data.pop("relative_path", None)
-        file = validated_data.pop("file", None)
-        artifact = validated_data.pop("artifact", None)
-
-        close_after = False
-        if file is None and artifact is not None:
-            file = artifact.file
-            file.open("rb")
-            close_after = True
-        try:
-            result = create_helmchart_content_from_tgz(file, relative_path=relative_path)
-        finally:
-            if close_after:
-                file.close()
-
-        if repository:
-            repository = repository.cast()
-            with repository.new_version() as new_version:
-                new_version.add_content(HelmChartContent.objects.filter(pk=result.content.pk))
-
-        return result.content
+    """Chart upload request; creation runs in Pulp's reserved content task."""
 
     class Meta:
         fields = HelmChartContentSerializer.Meta.fields
@@ -211,6 +220,13 @@ class AutoExcludedVersionSerializer(serializers.Serializer):
         return value.isoformat()
 
 
+class RetryAutoExclusionSerializer(serializers.Serializer):
+    """Identify exactly one automatic exclusion to remove."""
+
+    chart = serializers.CharField(allow_blank=False)
+    version = serializers.CharField(allow_blank=False)
+
+
 class HelmChartRemoteSerializer(RemoteSerializer):
     """
     Serializer for classic Helm chart remotes.
@@ -218,10 +234,9 @@ class HelmChartRemoteSerializer(RemoteSerializer):
 
     policy = serializers.ChoiceField(
         help_text=_(
-            "The policy to use when downloading content. For the first sync implementation "
-            "charts are downloaded immediately."
+            "Helm chart archives are downloaded during sync; only immediate is supported."
         ),
-        choices=models.Remote.POLICY_CHOICES,
+        choices=[(models.Remote.IMMEDIATE, models.Remote.IMMEDIATE)],
         default=models.Remote.IMMEDIATE,
     )
     include_charts = serializers.ListField(
@@ -234,7 +249,18 @@ class HelmChartRemoteSerializer(RemoteSerializer):
         child=serializers.CharField(),
         required=False,
         default=list,
-        help_text=_("Optional list of chart names to skip after include_charts is applied."),
+        help_text=_(
+            "Optional list of chart names to skip after include_charts is applied."
+        ),
+    )
+    allowed_chart_hosts = serializers.ListField(
+        child=serializers.CharField(allow_blank=False),
+        required=False,
+        default=list,
+        help_text=_(
+            "Exact archive hostnames allowed in addition to the remote origin. "
+            "Remote credentials and custom headers are never sent to these hosts."
+        ),
     )
     include_versions = serializers.DictField(
         child=serializers.ListField(child=serializers.CharField()),
@@ -259,7 +285,9 @@ class HelmChartRemoteSerializer(RemoteSerializer):
         choices=HelmChartRemote.CHECKSUM_MISMATCH_POLICIES,
         required=False,
         default="fail",
-        help_text=_("On checksum mismatch: fail, skip this sync, or exclude from future syncs."),
+        help_text=_(
+            "On checksum mismatch: fail, skip this sync, or exclude from future syncs."
+        ),
     )
     auto_excluded_versions = serializers.DictField(
         child=serializers.DictField(child=AutoExcludedVersionSerializer()),
@@ -267,13 +295,15 @@ class HelmChartRemoteSerializer(RemoteSerializer):
         default=dict,
         help_text=_(
             "Automatic exclusions keyed by chart name and version with checksum diagnostics. "
-            "PATCH with {} to clear all, or supply the complete mapping with entries removed."
+            "Use retry_auto_exclusion for a targeted retry; PATCH with {} to clear all."
         ),
     )
     latest_only = serializers.BooleanField(
         required=False,
         default=False,
-        help_text=_("If true, sync only the first index entry for each selected chart."),
+        help_text=_(
+            "If true, sync the highest semantic version for each selected chart after filters."
+        ),
     )
     ignore_unavailable = serializers.BooleanField(
         required=False,
@@ -281,10 +311,19 @@ class HelmChartRemoteSerializer(RemoteSerializer):
         help_text=_("If true, skip chart archives that return HTTP 403, 404, or 410."),
     )
 
+    def validate_allowed_chart_hosts(self, hosts):
+        from pulp_helmchart.helm import normalize_chart_host
+
+        try:
+            return list(dict.fromkeys(normalize_chart_host(host) for host in hosts))
+        except ValueError as exc:
+            raise serializers.ValidationError(str(exc)) from exc
+
     class Meta:
         fields = RemoteSerializer.Meta.fields + (
             "include_charts",
             "exclude_charts",
+            "allowed_chart_hosts",
             "include_versions",
             "exclude_versions",
             "checksum_mismatch_policy",
@@ -306,7 +345,11 @@ class HelmChartRepositorySyncURLSerializer(RepositorySyncURLSerializer):
         data = super().validate(data)
         if data.get("mirror"):
             raise serializers.ValidationError(
-                {"mirror": _("Mirror sync is not implemented for Helm chart repositories yet.")}
+                {
+                    "mirror": _(
+                        "Mirror sync is not implemented for Helm chart repositories yet."
+                    )
+                }
             )
         return data
 
@@ -338,6 +381,17 @@ class HelmChartPublicationSerializer(PublicationSerializer):
     Serializer for Helm chart publications.
     """
 
+    repository = DetailRelatedField(
+        required=False,
+        view_name_pattern=r"repositories(-.*/.*)?-detail",
+        queryset=HelmChartRepository.objects.all(),
+    )
+    repository_version = RepositoryVersionRelatedField(
+        required=False,
+        queryset=models.RepositoryVersion.objects.filter(
+            repository__in=HelmChartRepository.objects.all()
+        ),
+    )
     distributions = DetailRelatedField(
         help_text=_("This publication is currently hosted by these distributions."),
         source="distribution_set",
@@ -345,8 +399,11 @@ class HelmChartPublicationSerializer(PublicationSerializer):
         many=True,
         read_only=True,
     )
-    index = serializers.CharField(
-        help_text=_("Filename for the generated Helm repository index."),
+    index = serializers.ChoiceField(
+        help_text=_(
+            "The generated Helm repository index is always at publication root."
+        ),
+        choices=[("index.yaml", "index.yaml")],
         default="index.yaml",
         required=False,
     )
@@ -354,7 +411,11 @@ class HelmChartPublicationSerializer(PublicationSerializer):
 
     class Meta:
         model = HelmChartPublication
-        fields = PublicationSerializer.Meta.fields + ("distributions", "index", "checkpoint")
+        fields = PublicationSerializer.Meta.fields + (
+            "distributions",
+            "index",
+            "checkpoint",
+        )
 
 
 class HelmChartDistributionSerializer(DistributionSerializer):
@@ -362,11 +423,24 @@ class HelmChartDistributionSerializer(DistributionSerializer):
     Serializer for Helm chart distributions.
     """
 
+    repository = DetailRelatedField(
+        required=False,
+        allow_null=True,
+        view_name_pattern=r"repositories(-.*/.*)?-detail",
+        queryset=HelmChartRepository.objects.all(),
+    )
+    repository_version = RepositoryVersionRelatedField(
+        required=False,
+        allow_null=True,
+        queryset=models.RepositoryVersion.objects.filter(
+            repository__in=HelmChartRepository.objects.all()
+        ),
+    )
     publication = DetailRelatedField(
         required=False,
         help_text=_("Publication to be served"),
         view_name_pattern=r"publications(-.*/.*)?-detail",
-        queryset=models.Publication.objects.exclude(complete=False),
+        queryset=HelmChartPublication.objects.exclude(complete=False),
         allow_null=True,
     )
     checkpoint = serializers.BooleanField(required=False)

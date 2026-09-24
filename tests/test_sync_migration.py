@@ -19,6 +19,7 @@ def test_sync_fields_match_migration_state():
     )
     current = ModelState.from_model(HelmChartRemote)
     for name in (
+        "allowed_chart_hosts",
         "include_versions",
         "exclude_versions",
         "checksum_mismatch_policy",

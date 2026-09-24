@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import json
-from base64 import b64encode
+from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlencode
 
-import urllib3
-from pulpcore.client.pulpcore import ApiClient
+from pulpcore.client.pulpcore import ApiClient, Upload, UploadsApi
 from pulpcore.client.pulpcore.exceptions import ApiException
 
 from .models import (
@@ -39,11 +37,18 @@ class _Http:
     def __init__(self, api_client: ApiClient | None = None) -> None:
         self.api_client = api_client or ApiClient.get_default()
         self.configuration = self.api_client.configuration
-        self.pool = urllib3.PoolManager(
-            cert_reqs="CERT_REQUIRED" if getattr(self.configuration, "verify_ssl", True) else "CERT_NONE",
-            ca_certs=getattr(self.configuration, "ssl_ca_cert", None),
-            timeout=getattr(self.configuration, "timeout", None),
-        )
+        if "basicAuth" not in self.configuration.auth_settings():
+            if getattr(self.configuration, "access_token", None):
+                self.api_client.default_headers.setdefault(
+                    "Authorization", f"Bearer {self.configuration.access_token}"
+                )
+            elif api_key := self._authorization_api_key():
+                self.api_client.default_headers.setdefault("Authorization", api_key)
+
+    def _authorization_api_key(self) -> str | None:
+        if "Authorization" in self.configuration.api_key:
+            return self.configuration.get_api_key_with_prefix("Authorization")
+        return None
 
     def request(
         self,
@@ -53,47 +58,58 @@ class _Http:
         query: dict[str, Any] | None = None,
         body: Any = None,
         fields: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+        request_timeout: float | tuple[float, float] | None = None,
         response_model: type | None = None,
     ) -> Any:
-        url = self._url(path, query)
-        headers = self._headers()
-        request_kwargs: dict[str, Any] = {"headers": headers}
+        request_headers = {"Accept": "application/json", **(headers or {})}
+        auth = list(self.configuration.auth_settings())
+        if (
+            getattr(self.configuration, "access_token", None)
+            and "basicAuth" not in auth
+        ):
+            request_headers.setdefault(
+                "Authorization", f"Bearer {self.configuration.access_token}"
+            )
+        api_key = self._authorization_api_key()
+        if (
+            api_key
+            and "Authorization" not in request_headers
+            and "basicAuth" not in auth
+        ):
+            request_headers["Authorization"] = api_key
         if fields is not None:
-            request_kwargs["fields"] = fields
-            request_kwargs["encode_multipart"] = True
+            request_headers["Content-Type"] = "multipart/form-data"
         elif body is not None:
-            headers["Content-Type"] = "application/json"
-            request_kwargs["body"] = json.dumps(_to_payload(body)).encode()
-
-        response = self.pool.request(method, url, **request_kwargs)
+            request_headers["Content-Type"] = "application/json"
+        serialized = self.api_client.param_serialize(
+            method,
+            path,
+            query_params=list(_clean_query(query or {}).items()),
+            header_params=request_headers,
+            body=_to_payload(body) if body is not None else None,
+            post_params=list(fields.items()) if fields is not None else None,
+            auth_settings=auth,
+        )
+        response = self.api_client.call_api(
+            *serialized,
+            _request_timeout=(
+                request_timeout
+                if request_timeout is not None
+                else getattr(self.configuration, "timeout", None)
+            ),
+        )
+        payload_bytes = response.read()
         if response.status >= 400:
-            raise ApiException(status=response.status, reason=response.data.decode(errors="replace"))
-        if not response.data:
+            raise ApiException(
+                status=response.status, reason=payload_bytes.decode(errors="replace")
+            )
+        if not payload_bytes:
             return None
-        payload = json.loads(response.data.decode())
+        payload = json.loads(payload_bytes.decode())
         if response_model is None:
             return payload
         return response_model.from_dict(payload)
-
-    def _url(self, path: str, query: dict[str, Any] | None = None) -> str:
-        host = self.configuration.host.rstrip("/")
-        url = host + path
-        clean_query = _clean_query(query or {})
-        if clean_query:
-            url += "?" + urlencode(clean_query, doseq=True)
-        return url
-
-    def _headers(self) -> dict[str, str]:
-        headers = {
-            "Accept": "application/json",
-            "User-Agent": "OpenAPI-Generator/0.2.0.dev1/python",
-        }
-        username = getattr(self.configuration, "username", None)
-        password = getattr(self.configuration, "password", None)
-        if username is not None and password is not None:
-            token = b64encode(f"{username}:{password}".encode()).decode()
-            headers["Authorization"] = f"Basic {token}"
-        return headers
 
 
 class _CrudApi:
@@ -108,27 +124,61 @@ class _CrudApi:
         self._http = _Http(api_client)
 
     def list(self, **kwargs: Any) -> Any:
-        return self._http.request("GET", self.path, query=kwargs, response_model=self.page_model)
+        return self._http.request(
+            "GET",
+            self.path,
+            query=kwargs,
+            request_timeout=kwargs.get("_request_timeout"),
+            response_model=self.page_model,
+        )
 
     def read(self, **kwargs: Any) -> Any:
         href = _href_from_kwargs(kwargs, self.href_arg)
-        return self._http.request("GET", href, response_model=self.response_model)
+        return self._http.request(
+            "GET",
+            href,
+            request_timeout=kwargs.get("_request_timeout"),
+            response_model=self.response_model,
+        )
 
     def create(self, *args: Any, **kwargs: Any) -> Any:
         body = _single_body(args, kwargs)
-        return self._http.request("POST", self.path, body=body, response_model=self._mutation_response_model)
+        return self._http.request(
+            "POST",
+            self.path,
+            body=body,
+            request_timeout=kwargs.get("_request_timeout"),
+            response_model=self._mutation_response_model,
+        )
 
     def update(self, *args: Any, **kwargs: Any) -> Any:
         href, body = _href_and_body(args, kwargs, self.href_arg)
-        return self._http.request("PUT", href, body=body, response_model=self._mutation_response_model)
+        return self._http.request(
+            "PUT",
+            href,
+            body=body,
+            request_timeout=kwargs.get("_request_timeout"),
+            response_model=self._mutation_response_model,
+        )
 
     def partial_update(self, *args: Any, **kwargs: Any) -> Any:
         href, body = _href_and_body(args, kwargs, self.href_arg)
-        return self._http.request("PATCH", href, body=body, response_model=self._mutation_response_model)
+        return self._http.request(
+            "PATCH",
+            href,
+            body=body,
+            request_timeout=kwargs.get("_request_timeout"),
+            response_model=self._mutation_response_model,
+        )
 
     def delete(self, **kwargs: Any) -> Any:
         href = _href_from_kwargs(kwargs, self.href_arg)
-        return self._http.request("DELETE", href, response_model=AsyncOperationResponse)
+        return self._http.request(
+            "DELETE",
+            href,
+            request_timeout=kwargs.get("_request_timeout"),
+            response_model=AsyncOperationResponse,
+        )
 
     @property
     def _mutation_response_model(self) -> type:
@@ -152,6 +202,7 @@ class RepositoriesHelmchartApi(_CrudApi):
             "POST",
             self.path,
             body=helmchart_helmchart_repository,
+            request_timeout=_.get("_request_timeout"),
             response_model=HelmchartHelmchartRepositoryResponse,
         )
 
@@ -163,6 +214,7 @@ class RepositoriesHelmchartApi(_CrudApi):
         return self._http.request(
             "GET",
             helmchart_helmchart_repository_href,
+            request_timeout=_.get("_request_timeout"),
             response_model=HelmchartHelmchartRepositoryResponse,
         )
 
@@ -176,6 +228,7 @@ class RepositoriesHelmchartApi(_CrudApi):
             "PATCH",
             helmchart_helmchart_repository_href,
             body=patchedhelmchart_helmchart_repository,
+            request_timeout=_.get("_request_timeout"),
             response_model=HelmchartHelmchartRepositoryResponse,
         )
 
@@ -189,6 +242,7 @@ class RepositoriesHelmchartApi(_CrudApi):
             "PUT",
             helmchart_helmchart_repository_href,
             body=helmchart_helmchart_repository,
+            request_timeout=_.get("_request_timeout"),
             response_model=HelmchartHelmchartRepositoryResponse,
         )
 
@@ -200,6 +254,7 @@ class RepositoriesHelmchartApi(_CrudApi):
         return self._http.request(
             "DELETE",
             helmchart_helmchart_repository_href,
+            request_timeout=_.get("_request_timeout"),
             response_model=AsyncOperationResponse,
         )
 
@@ -214,6 +269,7 @@ class RepositoriesHelmchartApi(_CrudApi):
             "POST",
             path,
             body=repository_add_remove_content,
+            request_timeout=_.get("_request_timeout"),
             response_model=AsyncOperationResponse,
         )
 
@@ -232,6 +288,7 @@ class RepositoriesHelmchartApi(_CrudApi):
             "POST",
             path,
             body=body,
+            request_timeout=kwargs.get("_request_timeout"),
             response_model=AsyncOperationResponse,
         )
 
@@ -246,11 +303,17 @@ class RepositoriesHelmchartVersionsApi(_CrudApi):
             "GET",
             _join_href(helmchart_helmchart_repository_href, "versions/"),
             query=kwargs,
+            request_timeout=kwargs.get("_request_timeout"),
             response_model=self.page_model,
         )
 
     def read(self, repository_version_href: str, **_: Any) -> Any:
-        return self._http.request("GET", repository_version_href, response_model=self.response_model)
+        return self._http.request(
+            "GET",
+            repository_version_href,
+            request_timeout=_.get("_request_timeout"),
+            response_model=self.response_model,
+        )
 
 
 class ContentChartsApi(_CrudApi):
@@ -260,17 +323,54 @@ class ContentChartsApi(_CrudApi):
     page_model = PaginatedHelmchartChartContentResponseList
 
     def create(self, **kwargs: Any) -> AsyncOperationResponse:
-        fields = _content_fields(kwargs)
-        return self._http.request("POST", self.path, fields=fields, response_model=AsyncOperationResponse)
+        return self._send_chart(self.path, kwargs)
 
-    def upload(self, **kwargs: Any) -> HelmchartChartContentResponse:
-        fields = _content_fields(kwargs)
-        return self._http.request(
-            "POST",
-            _join_href(self.path, "upload/"),
-            fields=fields,
-            response_model=HelmchartChartContentResponse,
-        )
+    def upload(self, **kwargs: Any) -> AsyncOperationResponse:
+        return self._send_chart(_join_href(self.path, "upload/"), kwargs)
+
+    def _send_chart(self, path: str, kwargs: dict[str, Any]) -> AsyncOperationResponse:
+        kwargs = dict(kwargs)
+        file_path = kwargs.get("file")
+        if not isinstance(file_path, (str, Path)):
+            return self._http.request(
+                "POST",
+                path,
+                fields=_content_fields(kwargs),
+                request_timeout=kwargs.get("_request_timeout"),
+                response_model=AsyncOperationResponse,
+            )
+        if kwargs.get("upload"):
+            raise ValueError("Supply either file or upload, not both")
+        file_path = Path(file_path)
+        size = file_path.stat().st_size
+        uploads = UploadsApi(self._http.api_client)
+        timeout = kwargs.get("_request_timeout")
+        upload = uploads.create(Upload(size=size), _request_timeout=timeout)
+        try:
+            with file_path.open("rb") as handle:
+                start = 0
+                while chunk := handle.read(4 * 1024 * 1024):
+                    end = start + len(chunk) - 1
+                    uploads.update(
+                        content_range=f"bytes {start}-{end}/{size}",
+                        upload_href=upload.pulp_href,
+                        file=(file_path.name, chunk),
+                        _request_timeout=timeout,
+                    )
+                    start = end + 1
+            kwargs.pop("file")
+            kwargs["upload"] = upload.pulp_href
+            kwargs.setdefault("relative_path", file_path.name)
+            return self._http.request(
+                "POST",
+                path,
+                fields=_content_fields(kwargs),
+                request_timeout=kwargs.get("_request_timeout"),
+                response_model=AsyncOperationResponse,
+            )
+        except Exception:
+            uploads.delete(upload.pulp_href, _request_timeout=timeout)
+            raise
 
 
 ContentFilesApi = ContentChartsApi
@@ -293,11 +393,19 @@ class RemotesHelmchartApi(_CrudApi):
             "POST",
             self.path,
             body=helmchart_helmchart_remote,
+            request_timeout=_.get("_request_timeout"),
             response_model=HelmchartHelmchartRemoteResponse,
         )
 
-    def read(self, helmchart_helmchart_remote_href: str, **_: Any) -> HelmchartHelmchartRemoteResponse:
-        return self._http.request("GET", helmchart_helmchart_remote_href, response_model=HelmchartHelmchartRemoteResponse)
+    def read(
+        self, helmchart_helmchart_remote_href: str, **_: Any
+    ) -> HelmchartHelmchartRemoteResponse:
+        return self._http.request(
+            "GET",
+            helmchart_helmchart_remote_href,
+            request_timeout=_.get("_request_timeout"),
+            response_model=HelmchartHelmchartRemoteResponse,
+        )
 
     def partial_update(
         self,
@@ -309,11 +417,29 @@ class RemotesHelmchartApi(_CrudApi):
             "PATCH",
             helmchart_helmchart_remote_href,
             body=patchedhelmchart_helmchart_remote,
+            request_timeout=_.get("_request_timeout"),
             response_model=HelmchartHelmchartRemoteResponse,
         )
 
-    def delete(self, helmchart_helmchart_remote_href: str, **_: Any) -> AsyncOperationResponse:
-        return self._http.request("DELETE", helmchart_helmchart_remote_href, response_model=AsyncOperationResponse)
+    def delete(
+        self, helmchart_helmchart_remote_href: str, **_: Any
+    ) -> AsyncOperationResponse:
+        return self._http.request(
+            "DELETE",
+            helmchart_helmchart_remote_href,
+            request_timeout=_.get("_request_timeout"),
+            response_model=AsyncOperationResponse,
+        )
+
+    def retry_auto_exclusion(
+        self, helmchart_helmchart_remote_href: str, chart: str, version: str
+    ) -> AsyncOperationResponse:
+        return self._http.request(
+            "POST",
+            _join_href(helmchart_helmchart_remote_href, "retry_auto_exclusion/"),
+            body={"chart": chart, "version": version},
+            response_model=AsyncOperationResponse,
+        )
 
 
 class PublicationsHelmchartApi(_CrudApi):
@@ -336,6 +462,7 @@ class PublicationsHelmchartApi(_CrudApi):
             "POST",
             self.path,
             body=helmchart_helmchart_publication,
+            request_timeout=_.get("_request_timeout"),
             response_model=AsyncOperationResponse,
         )
 
@@ -347,6 +474,7 @@ class PublicationsHelmchartApi(_CrudApi):
         return self._http.request(
             "GET",
             helmchart_helmchart_publication_href,
+            request_timeout=_.get("_request_timeout"),
             response_model=HelmchartHelmchartPublicationResponse,
         )
 
@@ -358,6 +486,7 @@ class PublicationsHelmchartApi(_CrudApi):
         return self._http.request(
             "DELETE",
             helmchart_helmchart_publication_href,
+            request_timeout=_.get("_request_timeout"),
             response_model=AsyncOperationResponse,
         )
 
@@ -383,6 +512,7 @@ class DistributionsHelmchartApi(_CrudApi):
             "POST",
             self.path,
             body=helmchart_helmchart_distribution,
+            request_timeout=_.get("_request_timeout"),
             response_model=AsyncOperationResponse,
         )
 
@@ -394,6 +524,7 @@ class DistributionsHelmchartApi(_CrudApi):
         return self._http.request(
             "GET",
             helmchart_helmchart_distribution_href,
+            request_timeout=_.get("_request_timeout"),
             response_model=HelmchartHelmchartDistributionResponse,
         )
 
@@ -407,6 +538,7 @@ class DistributionsHelmchartApi(_CrudApi):
             "PATCH",
             helmchart_helmchart_distribution_href,
             body=patchedhelmchart_helmchart_distribution,
+            request_timeout=_.get("_request_timeout"),
             response_model=AsyncOperationResponse,
         )
 
@@ -420,6 +552,7 @@ class DistributionsHelmchartApi(_CrudApi):
             "PUT",
             helmchart_helmchart_distribution_href,
             body=helmchart_helmchart_distribution,
+            request_timeout=_.get("_request_timeout"),
             response_model=AsyncOperationResponse,
         )
 
@@ -431,6 +564,7 @@ class DistributionsHelmchartApi(_CrudApi):
         return self._http.request(
             "DELETE",
             helmchart_helmchart_distribution_href,
+            request_timeout=_.get("_request_timeout"),
             response_model=AsyncOperationResponse,
         )
 
@@ -461,7 +595,9 @@ def _single_body(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
     return values
 
 
-def _href_and_body(args: tuple[Any, ...], kwargs: dict[str, Any], href_arg: str) -> tuple[str, Any]:
+def _href_and_body(
+    args: tuple[Any, ...], kwargs: dict[str, Any], href_arg: str
+) -> tuple[str, Any]:
     href = kwargs.pop(href_arg, None)
     if href is None and args:
         href = args[0]

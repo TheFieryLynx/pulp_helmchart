@@ -29,7 +29,9 @@ class HelmChartContentResult:
     created: bool
 
 
-def create_helmchart_content_from_tgz(file, relative_path=None) -> HelmChartContentResult:
+def create_helmchart_content_from_tgz(
+    file, relative_path=None
+) -> HelmChartContentResult:
     """
     Validate a packaged Helm chart archive and create/reuse its Pulp content records.
 
@@ -95,12 +97,8 @@ def create_helmchart_content_from_tgz(file, relative_path=None) -> HelmChartCont
             created = True
 
     if not created:
+        validate_content_artifact_path(content, filename, digest)
         content.touch()
-        models.ContentArtifact.objects.update_or_create(
-            content=content,
-            relative_path=filename,
-            defaults={"artifact": artifact},
-        )
 
     return HelmChartContentResult(
         content=content,
@@ -110,9 +108,33 @@ def create_helmchart_content_from_tgz(file, relative_path=None) -> HelmChartCont
     )
 
 
+def validate_content_artifact_path(content, relative_path, digest):
+    """Reject attempts to change the one archive path belonging to chart content."""
+    paths = list(
+        models.ContentArtifact.objects.filter(content=content).values_list(
+            "relative_path", "artifact__sha256"
+        )
+    )
+    if len(paths) != 1 or paths[0][0] != content.filename:
+        raise serializers.ValidationError(
+            _(
+                "Chart content has ambiguous archive paths; repair it before reuse or publication."
+            )
+        )
+    if paths[0] != (relative_path, digest):
+        raise serializers.ValidationError(
+            _(
+                "Chart content already exists at '{path}'; identical bytes cannot be uploaded "
+                "under a different archive filename."
+            ).format(path=content.filename)
+        )
+
+
 def _get_or_create_artifact(file, digest):
     try:
-        artifact = models.Artifact.objects.get(sha256=digest, pulp_domain=get_domain_pk())
+        artifact = models.Artifact.objects.get(
+            sha256=digest, pulp_domain=get_domain_pk()
+        )
         if not artifact.pulp_domain.get_storage().exists(artifact.file.name):
             artifact.file = file
             artifact.save()

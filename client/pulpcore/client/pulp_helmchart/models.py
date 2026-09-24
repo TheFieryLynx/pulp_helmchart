@@ -131,7 +131,7 @@ class HelmchartHelmchartRemote(_Model):
     pulp_labels: dict[str, str | None] | None = None
     name: str
     url: str
-    policy: str | None = "immediate"
+    policy: Literal["immediate"] | None = "immediate"
     ca_cert: str | None = None
     client_cert: str | None = None
     client_key: str | None = None
@@ -151,6 +151,7 @@ class HelmchartHelmchartRemote(_Model):
     rate_limit: int | None = None
     include_charts: list[str] | None = None
     exclude_charts: list[str] | None = None
+    allowed_chart_hosts: list[str] | None = None
     include_versions: dict[str, list[str]] | None = None
     exclude_versions: dict[str, list[str]] | None = None
     checksum_mismatch_policy: Literal["fail", "skip", "exclude"] | None = "fail"
@@ -163,7 +164,7 @@ class PatchedhelmchartHelmchartRemote(_Model):
     pulp_labels: dict[str, str | None] | None = None
     name: str | None = None
     url: str | None = None
-    policy: str | None = None
+    policy: Literal["immediate"] | None = None
     ca_cert: str | None = None
     client_cert: str | None = None
     client_key: str | None = None
@@ -183,6 +184,7 @@ class PatchedhelmchartHelmchartRemote(_Model):
     rate_limit: int | None = None
     include_charts: list[str] | None = None
     exclude_charts: list[str] | None = None
+    allowed_chart_hosts: list[str] | None = None
     include_versions: dict[str, list[str]] | None = None
     exclude_versions: dict[str, list[str]] | None = None
     checksum_mismatch_policy: Literal["fail", "skip", "exclude"] | None = None
